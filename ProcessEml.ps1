@@ -899,8 +899,10 @@ try {
 
         try {
             # 会議出席依頼や連絡先など、メール以外のアイテムは処理対象外(失敗ではない)
+            # 実行全体の共通情報ではないため、後続メールの処理ログへ混入しないよう
+            # 共通ログには積まず、コンソール表示のみとする
             if ($mail.Class -ne $CONFIG.OutlookMailItemClass) {
-                Write-Log "[$mailIndex/$($selection.Count)] スキップ: メール以外のアイテム" -Level Warning
+                Write-Host "[$mailIndex/$($selection.Count)] スキップ: メール以外のアイテム" -ForegroundColor Yellow
                 $skippedCount++
                 continue
             }
