@@ -611,8 +611,15 @@ $footerHtml
         return $withHead
     }
 
-    # <head>が無い場合は先頭に用意する
-    return "<html><head>$headInsert</head>" + $htmlBody
+    # <head>が無い場合は、<html>の直後に<head>を作る
+    # (先頭に "<html><head>...</head>" を足すと<html>が二重になり不正なHTMLになるため)
+    $withHead = Add-HtmlAfterTag -html $htmlBody -tagPattern "<html[^>]*>" -insertHtml "<head>$headInsert</head>"
+    if ($withHead) {
+        return $withHead
+    }
+
+    # <html>も無い断片的なHTMLの場合のみ、完全なHTML文書として包む
+    return "<html><head>$headInsert</head>" + $htmlBody + "</html>"
 }
 
 function Invoke-EdgePrintToPdf {
