@@ -25,11 +25,17 @@ $CONFIG = @{
 
 # --- グローバル変数 ---
 # ログは「メールごとの保存フォルダ内」に保存する方式を基本とする。
-# 保存フォルダが確定する前のログは一時的にメモリ上(PendingLogBuffer)へ保持し、
-# フォルダ作成後にそのフォルダ内のログファイルへ書き出してから逐次追記に切り替える。
-# 保存フォルダを確定できないまま処理が失敗した場合のみ、デスクトップ直下へ退避する。
+# 起動時のOutlook接続確認・選択メール件数などは実行全体で共通のログとして
+# CommonLogBuffer に保持し続け(メールが切り替わっても消去しない)、
+# 現在処理中メール固有のログは MailLogBuffer に保持する。
+# 保存フォルダが確定した時点で「共通ログ + そのメールのログ」をまとめて
+# ログファイルへ書き出してから逐次追記に切り替える。
+# 保存フォルダを確定できないまま処理が失敗した場合のみ、両方のバッファを
+# デスクトップ直下へ退避する。
+$script:CommonLogBuffer = @()
+$script:MailLogBuffer = @()
 $script:CurrentLogFilePath = $null
-$script:PendingLogBuffer = @()
+$script:InMailContext = $false
 
 # ============================================
 # ユーティリティ関数
@@ -55,8 +61,10 @@ function Write-Log {
                 Write-Host "ログファイルへの書き込みに失敗しました。以降はコンソール出力のみになります: $_" -ForegroundColor Yellow
                 $script:CurrentLogFilePath = $null
             }
+        } elseif ($script:InMailContext) {
+            $script:MailLogBuffer += $logEntry
         } else {
-            $script:PendingLogBuffer += $logEntry
+            $script:CommonLogBuffer += $logEntry
         }
     }
 
@@ -71,9 +79,18 @@ function Write-Log {
 }
 
 function Reset-MailLogContext {
-    # メールごとの処理を開始する際、前のメールのログ状態を引き継がないようにする
+    # 1通のメール処理を開始する際に呼ぶ。共通ログ(CommonLogBuffer)は消去せず、
+    # そのメール固有の状態だけをリセットする。
     $script:CurrentLogFilePath = $null
-    $script:PendingLogBuffer = @()
+    $script:MailLogBuffer = @()
+    $script:InMailContext = $true
+}
+
+function End-MailLogContext {
+    # 1通のメール処理を終える際に呼ぶ。以降のログ(次のメールの開始前など)は
+    # 共通ログ側へ積まれるようにする。
+    $script:CurrentLogFilePath = $null
+    $script:InMailContext = $false
 }
 
 function Initialize-MailLog {
@@ -81,15 +98,16 @@ function Initialize-MailLog {
 
     if (-not $CONFIG.EnableLogging) { return }
 
-    # 保存フォルダ内に処理ログファイルを作成し、それまでのバッファ内容を書き出したうえで
+    # 保存フォルダ内に処理ログファイルを作成し、共通ログ+そのメールのログを書き出したうえで
     # 以降は逐次追記に切り替える。フォルダへログを書けない場合はデスクトップへ退避する。
     try {
         $logFileName = "処理ログ_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
         $logFilePath = Join-Path $OutputDir $logFileName
-        $initialContent = if ($script:PendingLogBuffer.Count -gt 0) { ($script:PendingLogBuffer -join "`r`n") + "`r`n" } else { "" }
+        $combined = @($script:CommonLogBuffer) + @($script:MailLogBuffer)
+        $initialContent = if ($combined.Count -gt 0) { ($combined -join "`r`n") + "`r`n" } else { "" }
         [System.IO.File]::WriteAllText($logFilePath, $initialContent, [System.Text.Encoding]::UTF8)
         $script:CurrentLogFilePath = $logFilePath
-        $script:PendingLogBuffer = @()
+        $script:MailLogBuffer = @()
     } catch {
         Write-Log "  処理ログの保存に失敗しました（保存先フォルダ: $OutputDir）: $_" -Level Warning
         Save-PendingLogToDesktop -Reason "保存フォルダへのログ書き込みに失敗(フォルダ: $OutputDir)"
@@ -102,11 +120,12 @@ function Save-PendingLogToDesktop {
     )
 
     if (-not $CONFIG.EnableLogging) {
-        $script:PendingLogBuffer = @()
+        $script:MailLogBuffer = @()
         return
     }
 
-    # 保存フォルダを確定できなかった場合の退避先。同時刻の衝突を避けるため連番を付与する。
+    # 保存フォルダを確定できなかった場合の退避先。共通ログ+そのメールのログをまとめて書き出す。
+    # 同時刻の衝突を避けるため連番を付与する。
     try {
         $baseName = "MailExporter_Error_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         $errorLogPath = Join-Path $CONFIG.DesktopPath "$baseName.txt"
@@ -123,13 +142,14 @@ function Save-PendingLogToDesktop {
             "理由: $Reason"
             "============================================"
         )
-        $body = $header + $script:PendingLogBuffer
+        $body = $header + @($script:CommonLogBuffer) + @($script:MailLogBuffer)
         [System.IO.File]::WriteAllText($errorLogPath, (($body -join "`r`n") + "`r`n"), [System.Text.Encoding]::UTF8)
         Write-Host "エラーログを保存しました: $errorLogPath" -ForegroundColor Yellow
     } catch {
         Write-Host "デスクトップへのエラーログ保存にも失敗しました: $_" -ForegroundColor Red
     } finally {
-        $script:PendingLogBuffer = @()
+        # 共通ログは以降のメールでも引き続き使うため消去しない。そのメール分だけ消去する。
+        $script:MailLogBuffer = @()
     }
 }
 
@@ -792,6 +812,9 @@ function Process-SingleMail {
         Write-ErrorDetailWithFallback -MailSubject $subjectForLog -Stage $stage -ErrorRecord $_ `
             -FallbackReason "メール処理中にエラー(段階: $stage)"
         return $null
+    } finally {
+        # 次のメール(または呼び出し元)のログが、このメールのコンテキストへ混入しないようにする
+        End-MailLogContext
     }
 }
 
@@ -867,7 +890,7 @@ try {
     }
 
     # 処理完了サマリー（ログは各メールの保存フォルダ内に個別にあるため、ここはコンソール表示のみ）
-    Reset-MailLogContext
+    End-MailLogContext
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Green
     Write-Host "処理完了" -ForegroundColor Green
@@ -887,8 +910,9 @@ try {
 
 } catch {
     # メール処理ループの外で起きた予期しないエラー。特定のメールの保存フォルダに紐づかないため
-    # 必ずデスクトップへ退避する。
-    Reset-MailLogContext
+    # 必ずデスクトップへ退避する。ここまでに蓄積した共通ログ(Outlook接続確認・選択メール件数等)を
+    # 消さずに残すため、CurrentLogFilePathだけを念のため無効化する(Reset-MailLogContextは呼ばない)。
+    $script:CurrentLogFilePath = $null
     Write-ErrorDetail -MailSubject "(不明)" -Stage "スクリプト全体(予期しないエラー)" -ErrorRecord $_
     Save-PendingLogToDesktop -Reason "スクリプト全体で予期しないエラー"
     exit 1
