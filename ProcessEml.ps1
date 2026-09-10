@@ -25,13 +25,18 @@ $CONFIG = @{
 
 # --- グローバル変数 ---
 $script:LogFilePath = $null
-$script:LogFileWriteWarned = $false
 
 # ============================================
 # ユーティリティ関数
 # ============================================
 
 function Initialize-LogFile {
+    # EnableLogging=false の場合はログファイルを一切作成しない
+    if (-not $CONFIG.EnableLogging) {
+        $script:LogFilePath = $null
+        return
+    }
+
     # 実行単位のログファイルを確定する。失敗してもコンソール出力のみで処理は継続する。
     try {
         $logDir = Join-Path $CONFIG.DesktopPath "MailExporter_Logs"
@@ -57,17 +62,14 @@ function Write-Log {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "[$timestamp] [$Level] $Message"
 
-    if ($CONFIG.EnableLogging) {
-        if ($script:LogFilePath) {
-            try {
-                [System.IO.File]::AppendAllText($script:LogFilePath, "$logEntry`r`n", [System.Text.Encoding]::UTF8)
-            } catch {
-                # ログ保存に失敗してもメール処理全体は止めず、コンソール出力のみ継続する
-                if (-not $script:LogFileWriteWarned) {
-                    $script:LogFileWriteWarned = $true
-                    Write-Host "ログファイルへの書き込みに失敗しました。以降はコンソール出力のみになります: $_" -ForegroundColor Yellow
-                }
-            }
+    if ($script:LogFilePath) {
+        try {
+            [System.IO.File]::AppendAllText($script:LogFilePath, "$logEntry`r`n", [System.Text.Encoding]::UTF8)
+        } catch {
+            # ログ保存に失敗してもメール処理全体は止めず、コンソール出力のみ継続する。
+            # 同じI/Oエラーを繰り返さないよう、以降のファイル書き込み自体を無効化する。
+            Write-Host "ログファイルへの書き込みに失敗しました。以降はコンソール出力のみになります: $_" -ForegroundColor Yellow
+            $script:LogFilePath = $null
         }
     }
 
@@ -88,20 +90,42 @@ function Write-ErrorDetail {
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    $ex = $ErrorRecord.Exception
-    $invocation = $ErrorRecord.InvocationInfo
+    # エラー記録処理自体が例外で落ちて元のエラー情報を失わないよう、
+    # 各項目の取得・出力を個別に防御する
+    try {
+        Write-Log "  [エラー詳細]" -Level Error
+        Write-Log "    発生日時: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level Error
+        Write-Log "    処理対象メール: $MailSubject" -Level Error
+        Write-Log "    処理段階: $Stage" -Level Error
 
-    Write-Log "  [エラー詳細]" -Level Error
-    Write-Log "    発生日時: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level Error
-    Write-Log "    処理対象メール: $MailSubject" -Level Error
-    Write-Log "    処理段階: $Stage" -Level Error
-    Write-Log "    例外種別: $($ex.GetType().FullName)" -Level Error
-    Write-Log "    Exception.Message: $($ex.Message)" -Level Error
-    if ($invocation) {
-        Write-Log "    発生位置: $($invocation.ScriptName):$($invocation.ScriptLineNumber) $($invocation.Line.Trim())" -Level Error
-    }
-    if ($ErrorRecord.ScriptStackTrace) {
-        Write-Log "    ScriptStackTrace: $($ErrorRecord.ScriptStackTrace)" -Level Error
+        try {
+            $ex = $ErrorRecord.Exception
+            Write-Log "    例外種別: $($ex.GetType().FullName)" -Level Error
+            Write-Log "    Exception.Message: $($ex.Message)" -Level Error
+        } catch {
+            Write-Log "    例外情報の取得に失敗しました: $_" -Level Error
+        }
+
+        try {
+            $invocation = $ErrorRecord.InvocationInfo
+            if ($invocation) {
+                $lineText = if ($invocation.Line) { $invocation.Line.Trim() } else { "" }
+                Write-Log "    発生位置: $($invocation.ScriptName):$($invocation.ScriptLineNumber) $lineText" -Level Error
+            }
+        } catch {
+            Write-Log "    発生位置の取得に失敗しました: $_" -Level Error
+        }
+
+        try {
+            if ($ErrorRecord.ScriptStackTrace) {
+                Write-Log "    ScriptStackTrace: $($ErrorRecord.ScriptStackTrace)" -Level Error
+            }
+        } catch {
+            Write-Log "    ScriptStackTraceの取得に失敗しました: $_" -Level Error
+        }
+    } catch {
+        # 上記の防御でも失敗した場合の最終フォールバック
+        Write-Host "エラー詳細の記録処理自体が失敗しました: $_" -ForegroundColor Red
     }
 }
 
@@ -699,22 +723,15 @@ try {
         }
     }
 
-    # 処理完了サマリー
+    # 処理完了サマリー（コンソール・ログファイルとも、ここで1回だけ表示する）
     Write-Log "============================================" -Level Info
     Write-Log "処理完了" -Level Success
     Write-Log "  成功: $processedCount 件" -Level Success
-    if ($errorCount -gt 0) {
-        Write-Log "  失敗: $errorCount 件" -Level Warning
+    Write-Log "  失敗: $errorCount 件" -Level $(if ($errorCount -gt 0) { 'Warning' } else { 'Success' })
+    if ($script:LogFilePath) {
+        Write-Log "  ログ: $script:LogFilePath" -Level Info
     }
     Write-Log "============================================" -Level Info
-
-    Write-Host ""
-    Write-Host "処理完了" -ForegroundColor Green
-    Write-Host "  成功: $processedCount 件" -ForegroundColor Green
-    Write-Host "  失敗: $errorCount 件" -ForegroundColor $(if ($errorCount -gt 0) { 'Yellow' } else { 'Green' })
-    if ($script:LogFilePath) {
-        Write-Host "  ログ: $script:LogFilePath" -ForegroundColor Green
-    }
 
     # フォルダ自動オープン
     if ($CONFIG.OpenFolderAfterProcess -and $processedFolders.Count -gt 0) {
