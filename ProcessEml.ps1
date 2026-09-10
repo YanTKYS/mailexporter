@@ -37,6 +37,14 @@ $script:MailLogBuffer = @()
 $script:CurrentLogFilePath = $null
 $script:InMailContext = $false
 
+# ログレベルごとのコンソール表示色
+$script:LogColors = @{
+    'Info'    = 'White'
+    'Warning' = 'Yellow'
+    'Error'   = 'Red'
+    'Success' = 'Green'
+}
+
 # ============================================
 # ユーティリティ関数
 # ============================================
@@ -68,17 +76,10 @@ function Write-Log {
         }
     }
 
-    $colors = @{
-        'Info' = 'White'
-        'Warning' = 'Yellow'
-        'Error' = 'Red'
-        'Success' = 'Green'
-    }
-
-    Write-Host $Message -ForegroundColor $colors[$Level]
+    Write-Host $Message -ForegroundColor $script:LogColors[$Level]
 }
 
-function Reset-MailLogContext {
+function Start-MailLogContext {
     # 1通のメール処理を開始する際に呼ぶ。共通ログ(CommonLogBuffer)は消去せず、
     # そのメール固有の状態だけをリセットする。
     $script:CurrentLogFilePath = $null
@@ -86,7 +87,7 @@ function Reset-MailLogContext {
     $script:InMailContext = $true
 }
 
-function End-MailLogContext {
+function Stop-MailLogContext {
     # 1通のメール処理を終える際に呼ぶ。以降のログ(次のメールの開始前など)は
     # 共通ログ側へ積まれるようにする。
     $script:CurrentLogFilePath = $null
@@ -157,60 +158,37 @@ function Write-ErrorDetail {
     param(
         [string]$MailSubject,
         [string]$Stage,
-        [System.Management.Automation.ErrorRecord]$ErrorRecord
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        # 指定した場合、保存フォルダのログへ書けていなければデスクトップへ退避する
+        [string]$FallbackReason
     )
 
     # エラー記録処理自体が例外で落ちて元のエラー情報を失わないよう、
-    # 各項目の取得・出力を個別に防御する
+    # 記録しやすい情報から順に出力しつつ全体を防御する
     try {
         Write-Log "  [エラー詳細]" -Level Error
         Write-Log "    発生日時: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level Error
         Write-Log "    処理対象メール: $MailSubject" -Level Error
         Write-Log "    処理段階: $Stage" -Level Error
 
-        try {
-            $ex = $ErrorRecord.Exception
-            Write-Log "    例外種別: $($ex.GetType().FullName)" -Level Error
-            Write-Log "    Exception.Message: $($ex.Message)" -Level Error
-        } catch {
-            Write-Log "    例外情報の取得に失敗しました: $_" -Level Error
+        $ex = $ErrorRecord.Exception
+        Write-Log "    例外種別: $($ex.GetType().FullName)" -Level Error
+        Write-Log "    エラー内容: $($ex.Message)" -Level Error
+
+        $invocation = $ErrorRecord.InvocationInfo
+        if ($invocation) {
+            $lineText = if ($invocation.Line) { $invocation.Line.Trim() } else { "" }
+            Write-Log "    発生位置: $($invocation.ScriptName):$($invocation.ScriptLineNumber) $lineText" -Level Error
         }
 
-        try {
-            $invocation = $ErrorRecord.InvocationInfo
-            if ($invocation) {
-                $lineText = if ($invocation.Line) { $invocation.Line.Trim() } else { "" }
-                Write-Log "    発生位置: $($invocation.ScriptName):$($invocation.ScriptLineNumber) $lineText" -Level Error
-            }
-        } catch {
-            Write-Log "    発生位置の取得に失敗しました: $_" -Level Error
-        }
-
-        try {
-            if ($ErrorRecord.ScriptStackTrace) {
-                Write-Log "    ScriptStackTrace: $($ErrorRecord.ScriptStackTrace)" -Level Error
-            }
-        } catch {
-            Write-Log "    ScriptStackTraceの取得に失敗しました: $_" -Level Error
+        if ($ErrorRecord.ScriptStackTrace) {
+            Write-Log "    ScriptStackTrace: $($ErrorRecord.ScriptStackTrace)" -Level Error
         }
     } catch {
-        # 上記の防御でも失敗した場合の最終フォールバック
         Write-Host "エラー詳細の記録処理自体が失敗しました: $_" -ForegroundColor Red
     }
-}
 
-function Write-ErrorDetailWithFallback {
-    param(
-        [string]$MailSubject,
-        [string]$Stage,
-        [System.Management.Automation.ErrorRecord]$ErrorRecord,
-        [string]$FallbackReason
-    )
-
-    Write-ErrorDetail -MailSubject $MailSubject -Stage $Stage -ErrorRecord $ErrorRecord
-
-    # 保存フォルダのログへ書けていた場合は何もしない。書けていない場合のみデスクトップへ退避する。
-    if (-not $script:CurrentLogFilePath) {
+    if ($FallbackReason -and -not $script:CurrentLogFilePath) {
         Save-PendingLogToDesktop -Reason $FallbackReason
     }
 }
@@ -225,7 +203,7 @@ function Get-SafeFilename {
     
     $replaceMap = @{
         '\' = '￥'; '/' = '／'; ':' = '：'; '*' = '＊'
-        '?' = '？'; '"' = '"'; '<' = '＜'; '>' = '＞'; '|' = '｜'
+        '?' = '？'; '"' = '＂'; '<' = '＜'; '>' = '＞'; '|' = '｜'
     }
     
     $safe = $str
@@ -249,30 +227,35 @@ function Get-SafeFolderPath {
         [string]$folderName,
         [int]$maxLength = 240
     )
-    
+
     $fullPath = Join-Path $basePath $folderName
-    
     if ($fullPath.Length -le $maxLength) {
-        return @{ Path = $fullPath; Truncated = $false }
+        return $fullPath
     }
-    
+
+    Write-Log "  パス長制限のためフォルダ名を短縮" -Level Warning
+
+    # 「yyyyMMdd_件名」の件名部分だけを、上限に収まる長さまで切り詰める。
+    # 使用済みの文字数 = 保存先フォルダ + 区切りの"\" + 日付8文字 + 区切りの"_"
+    #                    + 同名フォルダがあった場合に付く連番("_99"を想定して3文字)
     if ($folderName -match '^(\d{8})_(.+)$') {
         $datePrefix = $Matches[1]
         $subject = $Matches[2]
-        $availableLength = $maxLength - $basePath.Length - $datePrefix.Length - 11
-        
+        $usedLength = $basePath.Length + 1 + $datePrefix.Length + 1 + 3
+        $availableLength = $maxLength - $usedLength
+
         if ($availableLength -gt 10) {
-            $truncatedSubject = $subject.Substring(0, $availableLength)
-            $fullPath = Join-Path $basePath "${datePrefix}_${truncatedSubject}"
-            return @{ Path = $fullPath; Truncated = $true }
+            $truncatedSubject = $subject.Substring(0, [Math]::Min($availableLength, $subject.Length))
+            return (Join-Path $basePath "${datePrefix}_${truncatedSubject}")
         }
     }
-    
+
+    # 件名を削っても収まらない場合は、日付だけのフォルダ名にする
     if ($folderName -match '^(\d{8})') {
-        $fullPath = Join-Path $basePath $Matches[1]
+        return (Join-Path $basePath $Matches[1])
     }
-    
-    return @{ Path = $fullPath; Truncated = $true }
+
+    return $fullPath
 }
 
 function Release-Ref {
@@ -284,7 +267,6 @@ function Release-Ref {
         } catch {
             # 既に解放済みの場合は無視
         }
-        Remove-Variable ref -ErrorAction SilentlyContinue
     }
 }
 
@@ -352,28 +334,18 @@ function New-MailFolder {
         [string]$dateStr,
         [string]$subject
     )
-    
-    $safeSubject = Get-SafeFilename $subject -maxLength $CONFIG.MaxSubjectLength
-    $baseFolderName = "${dateStr}_${safeSubject}"
-    $pathInfo = Get-SafeFolderPath -basePath $CONFIG.DesktopPath `
-                                    -folderName $baseFolderName `
-                                    -maxLength $CONFIG.MaxPathLength
-    
-    if ($pathInfo.Truncated) {
-        Write-Log "  パス長制限のためフォルダ名を短縮" -Level Warning
-    }
-    
-    $outputDir = $pathInfo.Path
-    $counter = 1
-    $originalPath = $outputDir
 
-    # ワイルドカード解釈を避けるため、.NET のパス存在確認/作成APIを直接使用する
-    # (Split-Path は -Resolve を付けない限りファイルシステムに触れない文字列処理のため、
-    #  -Leaf 指定時はワイルドカード展開の影響を受けない)
+    $safeSubject = Get-SafeFilename $subject -maxLength $CONFIG.MaxSubjectLength
+    $outputDir = Get-SafeFolderPath -basePath $CONFIG.DesktopPath `
+                                    -folderName "${dateStr}_${safeSubject}" `
+                                    -maxLength $CONFIG.MaxPathLength
+
+    # 同じ日付・件名のフォルダが既にある場合は上書きせず _2, _3 ... と連番を付ける
+    $baseDir = $outputDir
+    $counter = 1
     while ([System.IO.Directory]::Exists($outputDir) -or [System.IO.File]::Exists($outputDir)) {
         $counter++
-        $folderName = Split-Path -Path $originalPath -Leaf
-        $outputDir = Join-Path $CONFIG.DesktopPath "${folderName}_${counter}"
+        $outputDir = "${baseDir}_${counter}"
     }
 
     [System.IO.Directory]::CreateDirectory($outputDir) | Out-Null
@@ -387,41 +359,43 @@ function Save-MailAttachments {
         $mail,
         [string]$outputDir
     )
-    
+
     $attachmentNames = @()
-    
+
     if ($mail.Attachments.Count -eq 0) {
         return $attachmentNames
     }
-    
+
     Write-Log "  添付処理: $($mail.Attachments.Count) 件" -Level Info
-    
+
     foreach ($att in $mail.Attachments) {
+        $attName = "(不明)"
         try {
             $attName = $att.FileName
             if ([string]::IsNullOrEmpty($attName)) { continue }
-            
-            $safeAttName = Get-SafeFilename $attName -maxLength 200
-            $savePath = Join-Path $outputDir $safeAttName
 
-            if ([System.IO.File]::Exists($savePath)) {
-                $ext = [System.IO.Path]::GetExtension($safeAttName)
-                $base = [System.IO.Path]::GetFileNameWithoutExtension($safeAttName)
-                $dupCounter = 1
-                do {
-                    $savePath = Join-Path $outputDir "${base}_${dupCounter}${ext}"
-                    $dupCounter++
-                } while ([System.IO.File]::Exists($savePath))
+            $saveName = Get-SafeFilename $attName -maxLength 200
+            $savePath = Join-Path $outputDir $saveName
+
+            # 同名の添付が複数ある場合は上書きせず _2, _3 ... と連番を付ける
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($saveName)
+            $ext = [System.IO.Path]::GetExtension($saveName)
+            $counter = 1
+            while ([System.IO.File]::Exists($savePath)) {
+                $counter++
+                $saveName = "${baseName}_${counter}${ext}"
+                $savePath = Join-Path $outputDir $saveName
             }
-            
+
             $att.SaveAsFile($savePath)
-            $attachmentNames += $safeAttName
-            
+            # 添付一覧(PDFフッター)には実際に保存したファイル名を載せる
+            $attachmentNames += $saveName
+
         } catch {
             Write-Log "  添付エラー: $attName - $_" -Level Warning
         }
     }
-    
+
     Write-Log "  添付保存: $($attachmentNames.Count) 件完了" -Level Success
     return $attachmentNames
 }
@@ -511,31 +485,56 @@ function Get-HtmlDocumentStyle {
 "@
 }
 
-function New-MailHtml {
+function Add-HtmlAfterTag {
+    param(
+        [string]$html,
+        [string]$tagPattern,
+        [string]$insertHtml
+    )
+
+    # -replace の置換文字列では "$1" などが特殊な意味を持ち、件名や添付ファイル名に
+    # "$" が含まれると内容が化けるため、挿入位置を求めて文字列連結で差し込む。
+    # 見つからない場合は $null を返す。
+    $tagMatch = [regex]::Match($html, $tagPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $tagMatch.Success) { return $null }
+
+    $insertPos = $tagMatch.Index + $tagMatch.Length
+    return $html.Substring(0, $insertPos) + $insertHtml + $html.Substring($insertPos)
+}
+
+function Add-HtmlBeforeTag {
+    param(
+        [string]$html,
+        [string]$tag,
+        [string]$insertHtml
+    )
+
+    # 閉じタグ(</body>など)の直前へ差し込む。見つからない場合は末尾に付ける。
+    $insertPos = $html.LastIndexOf($tag, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($insertPos -lt 0) { return $html + $insertHtml }
+
+    return $html.Substring(0, $insertPos) + $insertHtml + $html.Substring($insertPos)
+}
+
+function New-TextMailHtml {
     param(
         $mail,
-        $metadata,
-        [array]$attachmentNames
+        [string]$headerHtml,
+        [string]$footerHtml,
+        [string]$styleHtml,
+        [string]$title
     )
-    
-    $headerHtml = Get-MailHeaderHtml -metadata $metadata
-    $footerHtml = Get-MailFooterHtml -attachmentNames $attachmentNames
-    $styleHtml = Get-HtmlDocumentStyle
-    
-    $htmlBody = $mail.HTMLBody
-    
-    if ([string]::IsNullOrEmpty($htmlBody)) {
-        # テキストメール処理
-        $bodyText = if ([string]::IsNullOrEmpty($mail.Body)) { "(本文なし)" } else { $mail.Body }
-        $bodyEscaped = (Escape-HtmlText $bodyText) -replace "`r`n", "<br>" -replace "`n", "<br>"
-        
-        return @"
+
+    $bodyText = if ([string]::IsNullOrEmpty($mail.Body)) { "(本文なし)" } else { $mail.Body }
+    $bodyEscaped = (Escape-HtmlText $bodyText) -replace "`r`n", "<br>" -replace "`n", "<br>"
+
+    return @"
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset='utf-8'>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>$(Escape-HtmlText $metadata.Subject)</title>
+    <title>$title</title>
     $styleHtml
 </head>
 <body style="font-family: 'Meiryo', 'MS Gothic', sans-serif;">
@@ -547,34 +546,41 @@ $footerHtml
 </body>
 </html>
 "@
-    } else {
-        # HTMLメール処理
-        
-        # 【最重要】HTML文字列内のWordページ設定定義を無効化（置換）
-        # @page WordSection1 {...} のような定義を無効化
-        $htmlBody = $htmlBody -replace "@page\s+WordSection1", "@page WordSection1_Disabled"
-        # page: WordSection1; というプロパティ指定を無効化
-        $htmlBody = $htmlBody -replace "page:\s*WordSection1;?", "page: auto;"
-        
-        # 文字コード設定
-        if ($htmlBody -notmatch "charset\s*=\s*['""]?utf-8") {
-            if ($htmlBody -match "<head[^>]*>") {
-                $htmlBody = $htmlBody -replace "(<head[^>]*>)", "`$1<meta charset='utf-8'>$styleHtml"
-            } else {
-                $htmlBody = "<html><head><meta charset='utf-8'>$styleHtml</head>" + $htmlBody
-            }
-        } else {
-            if ($htmlBody -match "<head[^>]*>") {
-                $htmlBody = $htmlBody -replace "(<head[^>]*>)", "`$1$styleHtml"
-            }
-        }
-        
-        # ラッパー注入
-        if ($htmlBody -match "<body[^>]*>") {
-            $htmlBody = $htmlBody -replace "(<body[^>]*>)", "`$1<div style='padding:10px; page-break-inside: auto;'>$headerHtml"
-            $htmlBody = $htmlBody -replace "</body>", "$footerHtml</div></body>"
-        } else {
-            $htmlBody = @"
+}
+
+function New-MailHtml {
+    param(
+        $mail,
+        $metadata,
+        [array]$attachmentNames
+    )
+
+    $headerHtml = Get-MailHeaderHtml -metadata $metadata
+    $footerHtml = Get-MailFooterHtml -attachmentNames $attachmentNames
+    $styleHtml = Get-HtmlDocumentStyle
+
+    $htmlBody = $mail.HTMLBody
+
+    # テキスト形式のメールは、こちらでHTMLを組み立てる
+    if ([string]::IsNullOrEmpty($htmlBody)) {
+        return New-TextMailHtml -mail $mail -headerHtml $headerHtml -footerHtml $footerHtml `
+                                -styleHtml $styleHtml -title (Escape-HtmlText $metadata.Subject)
+    }
+
+    # --- ここからHTML形式のメール ---
+
+    # 【Wordセクション対策】Wordが出力する @page WordSection1 は
+    # 不要な改ページや余白を発生させるため無効化する
+    $htmlBody = $htmlBody -replace "@page\s+WordSection1", "@page WordSection1_Disabled"
+    $htmlBody = $htmlBody -replace "page:\s*WordSection1;?", "page: auto;"
+
+    # 本文の <body> 直後にヘッダー、</body> の直前にフッターを差し込む
+    $wrapped = Add-HtmlAfterTag -html $htmlBody -tagPattern "<body[^>]*>" `
+                                -insertHtml "<div style='padding:10px; page-break-inside: auto;'>$headerHtml"
+
+    if (-not $wrapped) {
+        # <body>を持たない断片的なHTMLの場合は、完全なHTMLとして組み立て直す
+        return @"
 <!DOCTYPE html>
 <html>
 <head>
@@ -590,17 +596,38 @@ $footerHtml
 </body>
 </html>
 "@
-        }
-        
-        return $htmlBody
     }
+
+    $htmlBody = Add-HtmlBeforeTag -html $wrapped -tag "</body>" -insertHtml "$footerHtml</div>"
+
+    # 文字コード指定とページ設定用スタイルを <head> へ追加する
+    $headInsert = $styleHtml
+    if ($htmlBody -notmatch "charset\s*=\s*['""]?utf-8") {
+        $headInsert = "<meta charset='utf-8'>" + $styleHtml
+    }
+
+    $withHead = Add-HtmlAfterTag -html $htmlBody -tagPattern "<head[^>]*>" -insertHtml $headInsert
+    if ($withHead) {
+        return $withHead
+    }
+
+    # <head>が無い場合は、<html>の直後に<head>を作る
+    # (先頭に "<html><head>...</head>" を足すと<html>が二重になり不正なHTMLになるため)
+    $withHead = Add-HtmlAfterTag -html $htmlBody -tagPattern "<html[^>]*>" -insertHtml "<head>$headInsert</head>"
+    if ($withHead) {
+        return $withHead
+    }
+
+    # <html>も無い断片的なHTMLの場合のみ、完全なHTML文書として包む
+    return "<html><head>$headInsert</head>" + $htmlBody + "</html>"
 }
 
 function Invoke-EdgePrintToPdf {
     param(
         [string]$EdgePath,
         [string]$HtmlUri,
-        [string]$PdfPath
+        [string]$PdfPath,
+        [string]$UserDataDir
     )
 
     # StandardOutput/StandardError はパイプのバッファが詰まると子プロセスがブロックし
@@ -621,6 +648,11 @@ function Invoke-EdgePrintToPdf {
             "--log-level=3"
             "--disable-logging"
             "--no-sandbox"
+            "--no-first-run"
+            "--no-default-browser-check"
+            # 職員が普段使いのEdgeを開いたままでもプロファイルが競合しないよう、
+            # 変換専用の一時プロファイルを使う
+            "--user-data-dir=`"$UserDataDir`""
             "--print-to-pdf=`"$PdfPath`""
             "`"$HtmlUri`""
         )
@@ -657,20 +689,16 @@ function Invoke-EdgePrintToPdf {
         try { $stdOut = $stdOutTask.Result } catch {}
         try { $stdErr = $stdErrTask.Result } catch {}
 
-        # PDF生成確認
-        $retryCount = 0
+        # Edgeの終了直後はPDFの書き込みが終わっていないことがあるため、
+        # ファイルができるまで一定回数だけ待つ
         $pdfSize = -1
-        while ($retryCount -lt $CONFIG.PdfRetryCount) {
-            if ([System.IO.File]::Exists($PdfPath)) {
-                Start-Sleep -Milliseconds 200
-                $fileInfo = Get-Item -LiteralPath $PdfPath -ErrorAction SilentlyContinue
-                if ($fileInfo) { $pdfSize = $fileInfo.Length }
-                if ($fileInfo -and $fileInfo.Length -gt $CONFIG.PdfMinFileSize) {
-                    return $true
-                }
+        for ($retryCount = 0; $retryCount -lt $CONFIG.PdfRetryCount; $retryCount++) {
+            $pdfFile = Get-Item -LiteralPath $PdfPath -ErrorAction SilentlyContinue
+            if ($pdfFile) {
+                $pdfSize = $pdfFile.Length
+                if ($pdfSize -gt $CONFIG.PdfMinFileSize) { return $true }
             }
             Start-Sleep -Milliseconds $CONFIG.PdfRetryInterval
-            $retryCount++
         }
 
         # 失敗時のみ、原因追跡に必要な情報を記録する（成功時は残さない）
@@ -712,13 +740,15 @@ function Convert-MailHtmlToPdf {
 
         $tempHtmlPath = Join-Path $tempWorkDir "mail.html"
         $tempPdfPath = Join-Path $tempWorkDir "mail.pdf"
+        $tempProfileDir = Join-Path $tempWorkDir "profile"
 
         [System.IO.File]::WriteAllText($tempHtmlPath, $Html, [System.Text.Encoding]::UTF8)
 
         # 空白等を含む一時パスでもコマンドライン上で問題にならないよう file:// URI化する
         $htmlUri = ([System.Uri]$tempHtmlPath).AbsoluteUri
 
-        $pdfOk = Invoke-EdgePrintToPdf -EdgePath $EdgePath -HtmlUri $htmlUri -PdfPath $tempPdfPath
+        $pdfOk = Invoke-EdgePrintToPdf -EdgePath $EdgePath -HtmlUri $htmlUri -PdfPath $tempPdfPath `
+                                       -UserDataDir $tempProfileDir
         if (-not $pdfOk) {
             return $false
         }
@@ -753,19 +783,13 @@ function Process-SingleMail {
     )
 
     # 前のメールのログ状態(バッファ/ログファイル)を引き継がない
-    Reset-MailLogContext
+    Start-MailLogContext
 
-    $stage = "メール種別確認"
+    $stage = "メタデータ取得"
     $subjectForLog = "(不明)"
 
     try {
-        if ($mail.Class -ne $CONFIG.OutlookMailItemClass) {
-            Write-Log "[$index/$total] スキップ: メールアイテム以外" -Level Warning
-            return $null
-        }
-
         # メタデータ取得
-        $stage = "メタデータ取得"
         $metadata = Get-MailMetadata -mail $mail
         $subjectForLog = $metadata.Subject
         Write-Log "[$index/$total] 処理中: $($metadata.Subject)" -Level Info
@@ -809,12 +833,12 @@ function Process-SingleMail {
 
     } catch {
         # 保存フォルダのログに書けていればそこへ、書けていなければデスクトップへ退避する
-        Write-ErrorDetailWithFallback -MailSubject $subjectForLog -Stage $stage -ErrorRecord $_ `
+        Write-ErrorDetail -MailSubject $subjectForLog -Stage $stage -ErrorRecord $_ `
             -FallbackReason "メール処理中にエラー(段階: $stage)"
         return $null
     } finally {
         # 次のメール(または呼び出し元)のログが、このメールのコンテキストへ混入しないようにする
-        End-MailLogContext
+        Stop-MailLogContext
     }
 }
 
@@ -827,6 +851,7 @@ $explorer = $null
 $selection = $null
 $processedCount = 0
 $errorCount = 0
+$skippedCount = 0
 $processedFolders = @()
 
 try {
@@ -873,6 +898,15 @@ try {
         $mailIndex++
 
         try {
+            # 会議出席依頼や連絡先など、メール以外のアイテムは処理対象外(失敗ではない)
+            # 実行全体の共通情報ではないため、後続メールの処理ログへ混入しないよう
+            # 共通ログには積まず、コンソール表示のみとする
+            if ($mail.Class -ne $CONFIG.OutlookMailItemClass) {
+                Write-Host "[$mailIndex/$($selection.Count)] スキップ: メール以外のアイテム" -ForegroundColor Yellow
+                $skippedCount++
+                continue
+            }
+
             $outputDir = Process-SingleMail -mail $mail -index $mailIndex -total $selection.Count -edgePath $edgePath
 
             if ($outputDir) {
@@ -883,19 +917,22 @@ try {
             }
 
         } catch {
-            Write-ErrorDetailWithFallback -MailSubject "(不明)" -Stage "メール処理(予期しないエラー)" -ErrorRecord $_ `
+            Write-ErrorDetail -MailSubject "(不明)" -Stage "メール処理(予期しないエラー)" -ErrorRecord $_ `
                 -FallbackReason "メール処理中に予期しないエラー"
             $errorCount++
         }
     }
 
     # 処理完了サマリー（ログは各メールの保存フォルダ内に個別にあるため、ここはコンソール表示のみ）
-    End-MailLogContext
+    Stop-MailLogContext
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Green
     Write-Host "処理完了" -ForegroundColor Green
     Write-Host "  成功: $processedCount 件" -ForegroundColor Green
     Write-Host "  失敗: $errorCount 件" -ForegroundColor $(if ($errorCount -gt 0) { 'Yellow' } else { 'Green' })
+    if ($skippedCount -gt 0) {
+        Write-Host "  スキップ(メール以外): $skippedCount 件" -ForegroundColor Yellow
+    }
     Write-Host "============================================" -ForegroundColor Green
 
     # フォルダ自動オープン
@@ -911,10 +948,10 @@ try {
 } catch {
     # メール処理ループの外で起きた予期しないエラー。特定のメールの保存フォルダに紐づかないため
     # 必ずデスクトップへ退避する。ここまでに蓄積した共通ログ(Outlook接続確認・選択メール件数等)を
-    # 消さずに残すため、CurrentLogFilePathだけを念のため無効化する(Reset-MailLogContextは呼ばない)。
+    # 消さずに残すため、CurrentLogFilePathだけを念のため無効化する(Start-MailLogContextは呼ばない)。
     $script:CurrentLogFilePath = $null
-    Write-ErrorDetail -MailSubject "(不明)" -Stage "スクリプト全体(予期しないエラー)" -ErrorRecord $_
-    Save-PendingLogToDesktop -Reason "スクリプト全体で予期しないエラー"
+    Write-ErrorDetail -MailSubject "(不明)" -Stage "スクリプト全体(予期しないエラー)" -ErrorRecord $_ `
+        -FallbackReason "スクリプト全体で予期しないエラー"
     exit 1
 } finally {
     # COM解放
