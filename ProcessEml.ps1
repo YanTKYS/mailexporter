@@ -24,33 +24,22 @@ $CONFIG = @{
 }
 
 # --- グローバル変数 ---
-$script:LogFilePath = $null
+# ログは「メールごとの保存フォルダ内」に保存する方式を基本とする。
+# 起動時のOutlook接続確認・選択メール件数などは実行全体で共通のログとして
+# CommonLogBuffer に保持し続け(メールが切り替わっても消去しない)、
+# 現在処理中メール固有のログは MailLogBuffer に保持する。
+# 保存フォルダが確定した時点で「共通ログ + そのメールのログ」をまとめて
+# ログファイルへ書き出してから逐次追記に切り替える。
+# 保存フォルダを確定できないまま処理が失敗した場合のみ、両方のバッファを
+# デスクトップ直下へ退避する。
+$script:CommonLogBuffer = @()
+$script:MailLogBuffer = @()
+$script:CurrentLogFilePath = $null
+$script:InMailContext = $false
 
 # ============================================
 # ユーティリティ関数
 # ============================================
-
-function Initialize-LogFile {
-    # EnableLogging=false の場合はログファイルを一切作成しない
-    if (-not $CONFIG.EnableLogging) {
-        $script:LogFilePath = $null
-        return
-    }
-
-    # 実行単位のログファイルを確定する。失敗してもコンソール出力のみで処理は継続する。
-    try {
-        $logDir = Join-Path $CONFIG.DesktopPath "MailExporter_Logs"
-        if (-not [System.IO.Directory]::Exists($logDir)) {
-            [System.IO.Directory]::CreateDirectory($logDir) | Out-Null
-        }
-        $logFileName = "MailExporter_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-        $script:LogFilePath = Join-Path $logDir $logFileName
-        [System.IO.File]::WriteAllText($script:LogFilePath, "", [System.Text.Encoding]::UTF8)
-    } catch {
-        $script:LogFilePath = $null
-        Write-Host "ログファイルの初期化に失敗しました。コンソール出力のみで処理を継続します: $_" -ForegroundColor Yellow
-    }
-}
 
 function Write-Log {
     param(
@@ -62,14 +51,20 @@ function Write-Log {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "[$timestamp] [$Level] $Message"
 
-    if ($script:LogFilePath) {
-        try {
-            [System.IO.File]::AppendAllText($script:LogFilePath, "$logEntry`r`n", [System.Text.Encoding]::UTF8)
-        } catch {
-            # ログ保存に失敗してもメール処理全体は止めず、コンソール出力のみ継続する。
-            # 同じI/Oエラーを繰り返さないよう、以降のファイル書き込み自体を無効化する。
-            Write-Host "ログファイルへの書き込みに失敗しました。以降はコンソール出力のみになります: $_" -ForegroundColor Yellow
-            $script:LogFilePath = $null
+    if ($CONFIG.EnableLogging) {
+        if ($script:CurrentLogFilePath) {
+            try {
+                [System.IO.File]::AppendAllText($script:CurrentLogFilePath, "$logEntry`r`n", [System.Text.Encoding]::UTF8)
+            } catch {
+                # ログ保存に失敗してもメール処理全体は止めず、コンソール出力のみ継続する。
+                # 同じI/Oエラーを繰り返さないよう、以降のファイル書き込み自体を無効化する。
+                Write-Host "ログファイルへの書き込みに失敗しました。以降はコンソール出力のみになります: $_" -ForegroundColor Yellow
+                $script:CurrentLogFilePath = $null
+            }
+        } elseif ($script:InMailContext) {
+            $script:MailLogBuffer += $logEntry
+        } else {
+            $script:CommonLogBuffer += $logEntry
         }
     }
 
@@ -81,6 +76,81 @@ function Write-Log {
     }
 
     Write-Host $Message -ForegroundColor $colors[$Level]
+}
+
+function Reset-MailLogContext {
+    # 1通のメール処理を開始する際に呼ぶ。共通ログ(CommonLogBuffer)は消去せず、
+    # そのメール固有の状態だけをリセットする。
+    $script:CurrentLogFilePath = $null
+    $script:MailLogBuffer = @()
+    $script:InMailContext = $true
+}
+
+function End-MailLogContext {
+    # 1通のメール処理を終える際に呼ぶ。以降のログ(次のメールの開始前など)は
+    # 共通ログ側へ積まれるようにする。
+    $script:CurrentLogFilePath = $null
+    $script:InMailContext = $false
+}
+
+function Initialize-MailLog {
+    param([string]$OutputDir)
+
+    if (-not $CONFIG.EnableLogging) { return }
+
+    # 保存フォルダ内に処理ログファイルを作成し、共通ログ+そのメールのログを書き出したうえで
+    # 以降は逐次追記に切り替える。フォルダへログを書けない場合はデスクトップへ退避する。
+    try {
+        $logFileName = "処理ログ_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+        $logFilePath = Join-Path $OutputDir $logFileName
+        $combined = @($script:CommonLogBuffer) + @($script:MailLogBuffer)
+        $initialContent = if ($combined.Count -gt 0) { ($combined -join "`r`n") + "`r`n" } else { "" }
+        [System.IO.File]::WriteAllText($logFilePath, $initialContent, [System.Text.Encoding]::UTF8)
+        $script:CurrentLogFilePath = $logFilePath
+        $script:MailLogBuffer = @()
+    } catch {
+        Write-Log "  処理ログの保存に失敗しました（保存先フォルダ: $OutputDir）: $_" -Level Warning
+        Save-PendingLogToDesktop -Reason "保存フォルダへのログ書き込みに失敗(フォルダ: $OutputDir)"
+    }
+}
+
+function Save-PendingLogToDesktop {
+    param(
+        [string]$Reason
+    )
+
+    if (-not $CONFIG.EnableLogging) {
+        $script:MailLogBuffer = @()
+        return
+    }
+
+    # 保存フォルダを確定できなかった場合の退避先。共通ログ+そのメールのログをまとめて書き出す。
+    # 同時刻の衝突を避けるため連番を付与する。
+    try {
+        $baseName = "MailExporter_Error_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        $errorLogPath = Join-Path $CONFIG.DesktopPath "$baseName.txt"
+        $suffix = 1
+        while ([System.IO.File]::Exists($errorLogPath)) {
+            $suffix++
+            $errorLogPath = Join-Path $CONFIG.DesktopPath "${baseName}_$suffix.txt"
+        }
+
+        $header = @(
+            "============================================"
+            "MailExporter エラーログ"
+            "発生日時: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            "理由: $Reason"
+            "============================================"
+        )
+        $body = $header + @($script:CommonLogBuffer) + @($script:MailLogBuffer)
+        [System.IO.File]::WriteAllText($errorLogPath, (($body -join "`r`n") + "`r`n"), [System.Text.Encoding]::UTF8)
+        Write-Host "エラーログを保存しました: $errorLogPath" -ForegroundColor Yellow
+    } catch {
+        Write-Host "デスクトップへのエラーログ保存にも失敗しました: $_" -ForegroundColor Red
+    } finally {
+        # 共通ログは以降のメールでも引き続き使うため消去しない。そのメール分だけ消去する。
+        $script:MailLogBuffer = @()
+    }
 }
 
 function Write-ErrorDetail {
@@ -126,6 +196,22 @@ function Write-ErrorDetail {
     } catch {
         # 上記の防御でも失敗した場合の最終フォールバック
         Write-Host "エラー詳細の記録処理自体が失敗しました: $_" -ForegroundColor Red
+    }
+}
+
+function Write-ErrorDetailWithFallback {
+    param(
+        [string]$MailSubject,
+        [string]$Stage,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [string]$FallbackReason
+    )
+
+    Write-ErrorDetail -MailSubject $MailSubject -Stage $Stage -ErrorRecord $ErrorRecord
+
+    # 保存フォルダのログへ書けていた場合は何もしない。書けていない場合のみデスクトップへ退避する。
+    if (-not $script:CurrentLogFilePath) {
+        Save-PendingLogToDesktop -Reason $FallbackReason
     }
 }
 
@@ -510,13 +596,21 @@ $footerHtml
     }
 }
 
-function Convert-HtmlToPdf {
+function Invoke-EdgePrintToPdf {
     param(
-        [string]$HtmlPath,
-        [string]$PdfPath,
-        [string]$EdgePath
+        [string]$EdgePath,
+        [string]$HtmlUri,
+        [string]$PdfPath
     )
-    
+
+    # StandardOutput/StandardError はパイプのバッファが詰まると子プロセスがブロックし
+    # デッドロックする恐れがあるため、WaitForExit を待つ前に非同期読み取りを開始する
+    # (Process.StandardOutput/Error.ReadToEndAsync は .NET Framework 4.5+ で利用可能)。
+    $process = $null
+    $stdOut = ""
+    $stdErr = ""
+    $exitCode = $null
+
     try {
         $argList = @(
             "--headless"
@@ -528,7 +622,7 @@ function Convert-HtmlToPdf {
             "--disable-logging"
             "--no-sandbox"
             "--print-to-pdf=`"$PdfPath`""
-            "`"$HtmlPath`""
+            "`"$HtmlUri`""
         )
 
         $processInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -538,24 +632,39 @@ function Convert-HtmlToPdf {
         $processInfo.RedirectStandardOutput = $true
         $processInfo.RedirectStandardError = $true
         $processInfo.CreateNoWindow = $true
-        
+
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         $process.Start() | Out-Null
-        
+
+        $stdOutTask = $process.StandardOutput.ReadToEndAsync()
+        $stdErrTask = $process.StandardError.ReadToEndAsync()
+
         $exited = $process.WaitForExit($CONFIG.PdfTimeout * 1000)
-        
+
         if (-not $exited) {
-            $process.Kill()
-            throw "PDF変換がタイムアウトしました（$($CONFIG.PdfTimeout)秒）"
+            try { $process.Kill() } catch {}
+            try { $stdOut = $stdOutTask.Result } catch {}
+            try { $stdErr = $stdErrTask.Result } catch {}
+            Write-Log "  Edge実行ファイル: $EdgePath" -Level Error
+            Write-Log "  PDF変換タイムアウト（$($CONFIG.PdfTimeout)秒）" -Level Error
+            if ($stdErr) { Write-Log "  StandardError: $stdErr" -Level Error }
+            if ($stdOut) { Write-Log "  StandardOutput: $stdOut" -Level Error }
+            return $false
         }
-        
+
+        $exitCode = $process.ExitCode
+        try { $stdOut = $stdOutTask.Result } catch {}
+        try { $stdErr = $stdErrTask.Result } catch {}
+
         # PDF生成確認
         $retryCount = 0
+        $pdfSize = -1
         while ($retryCount -lt $CONFIG.PdfRetryCount) {
             if ([System.IO.File]::Exists($PdfPath)) {
                 Start-Sleep -Milliseconds 200
                 $fileInfo = Get-Item -LiteralPath $PdfPath -ErrorAction SilentlyContinue
+                if ($fileInfo) { $pdfSize = $fileInfo.Length }
                 if ($fileInfo -and $fileInfo.Length -gt $CONFIG.PdfMinFileSize) {
                     return $true
                 }
@@ -563,14 +672,70 @@ function Convert-HtmlToPdf {
             Start-Sleep -Milliseconds $CONFIG.PdfRetryInterval
             $retryCount++
         }
-        
-        throw "PDFファイルが正しく生成されませんでした"
-        
+
+        # 失敗時のみ、原因追跡に必要な情報を記録する（成功時は残さない）
+        Write-Log "  Edge実行ファイル: $EdgePath" -Level Error
+        Write-Log "  Edge ExitCode: $exitCode" -Level Error
+        Write-Log "  PDF出力ファイルの存在: $([System.IO.File]::Exists($PdfPath))" -Level Error
+        Write-Log "  PDF出力ファイルサイズ: $pdfSize" -Level Error
+        if ($stdErr) { Write-Log "  StandardError: $stdErr" -Level Error }
+        if ($stdOut) { Write-Log "  StandardOutput: $stdOut" -Level Error }
+        return $false
+
     } catch {
-        throw "PDF変換エラー: $_"
+        Write-Log "  PDF変換処理でエラー: $_" -Level Error
+        Write-Log "  Edge実行ファイル: $EdgePath" -Level Error
+        return $false
     } finally {
-        if ($process -and -not $process.HasExited) {
-            $process.Kill()
+        if ($process) {
+            try {
+                if (-not $process.HasExited) { $process.Kill() }
+            } catch {}
+            $process.Dispose()
+        }
+    }
+}
+
+function Convert-MailHtmlToPdf {
+    param(
+        [string]$Html,
+        [string]$EdgePath,
+        [string]$FinalPdfPath
+    )
+
+    # 件名等の利用者由来の長い/特殊文字を含むパスをEdgeへ直接渡さないよう、
+    # %TEMP%\MailExporter\{GUID}\ の短い一時フォルダ内だけで変換を完結させる。
+    $tempWorkDir = Join-Path ([System.IO.Path]::GetTempPath()) "MailExporter\$([System.Guid]::NewGuid().ToString('N'))"
+
+    try {
+        [System.IO.Directory]::CreateDirectory($tempWorkDir) | Out-Null
+
+        $tempHtmlPath = Join-Path $tempWorkDir "mail.html"
+        $tempPdfPath = Join-Path $tempWorkDir "mail.pdf"
+
+        [System.IO.File]::WriteAllText($tempHtmlPath, $Html, [System.Text.Encoding]::UTF8)
+
+        # 空白等を含む一時パスでもコマンドライン上で問題にならないよう file:// URI化する
+        $htmlUri = ([System.Uri]$tempHtmlPath).AbsoluteUri
+
+        $pdfOk = Invoke-EdgePrintToPdf -EdgePath $EdgePath -HtmlUri $htmlUri -PdfPath $tempPdfPath
+        if (-not $pdfOk) {
+            return $false
+        }
+
+        [System.IO.File]::Move($tempPdfPath, $FinalPdfPath)
+        return $true
+
+    } catch {
+        Write-Log "  PDF変換エラー: $_" -Level Error
+        return $false
+    } finally {
+        try {
+            if ([System.IO.Directory]::Exists($tempWorkDir)) {
+                [System.IO.Directory]::Delete($tempWorkDir, $true)
+            }
+        } catch {
+            Write-Log "  一時作業フォルダの削除に失敗しました（$tempWorkDir）: $_" -Level Warning
         }
     }
 }
@@ -586,6 +751,9 @@ function Process-SingleMail {
         [int]$total,
         [string]$edgePath
     )
+
+    # 前のメールのログ状態(バッファ/ログファイル)を引き継がない
+    Reset-MailLogContext
 
     $stage = "メール種別確認"
     $subjectForLog = "(不明)"
@@ -606,6 +774,9 @@ function Process-SingleMail {
         $stage = "フォルダ作成"
         $outputDir = New-MailFolder -dateStr $metadata.DateStr -subject $metadata.Subject
 
+        # フォルダが確定したので、以降のログはこのフォルダ内へ保存する
+        Initialize-MailLog -OutputDir $outputDir
+
         # 添付ファイル保存
         $stage = "添付ファイル保存"
         $attachmentNames = Save-MailAttachments -mail $mail -outputDir $outputDir
@@ -614,32 +785,21 @@ function Process-SingleMail {
         $stage = "HTML生成"
         $finalHtml = New-MailHtml -mail $mail -metadata $metadata -attachmentNames $attachmentNames
 
-        # 一時HTMLファイル保存（件名由来のパスに [ ] 等を含んでもワイルドカード解釈されないよう -LiteralPath を使用）
-        $stage = "一時HTMLファイル保存"
-        $tempHtml = Join-Path $outputDir "_temp_mail.html"
-        Set-Content -LiteralPath $tempHtml -Value $finalHtml -Encoding UTF8 -Force
-
-        # PDF変換
+        # PDF変換（Edgeとのやり取りは短い一時フォルダ内で完結させ、完成後に保存フォルダへ移動する）
         $stage = "PDF変換"
         $safeSender = Get-SafeFilename $metadata.SenderName -maxLength $CONFIG.MaxSenderLength
         $pdfName = "$($metadata.DateStr)_${safeSender}mail.pdf"
-        $pdfPath = Join-Path $outputDir $pdfName
+        $finalPdfPath = Join-Path $outputDir $pdfName
 
         Write-Log "  PDF変換中..." -Level Info
 
-        try {
-            $pdfResult = Convert-HtmlToPdf -HtmlPath $tempHtml -PdfPath $pdfPath -EdgePath $edgePath
+        $pdfResult = Convert-MailHtmlToPdf -Html $finalHtml -EdgePath $edgePath -FinalPdfPath $finalPdfPath
 
-            if ($pdfResult) {
-                Write-Log "  PDF作成: $pdfName" -Level Success
-            } else {
-                Write-Log "  PDF生成失敗" -Level Error
-                return $null
-            }
-        } finally {
-            if ([System.IO.File]::Exists($tempHtml)) {
-                Remove-Item -LiteralPath $tempHtml -Force -ErrorAction SilentlyContinue
-            }
+        if ($pdfResult) {
+            Write-Log "  PDF作成: $pdfName" -Level Success
+        } else {
+            Write-Log "  PDF生成失敗" -Level Error
+            return $null
         }
 
         Write-Log "  完了 ✓" -Level Success
@@ -648,8 +808,13 @@ function Process-SingleMail {
         return $outputDir
 
     } catch {
-        Write-ErrorDetail -MailSubject $subjectForLog -Stage $stage -ErrorRecord $_
+        # 保存フォルダのログに書けていればそこへ、書けていなければデスクトップへ退避する
+        Write-ErrorDetailWithFallback -MailSubject $subjectForLog -Stage $stage -ErrorRecord $_ `
+            -FallbackReason "メール処理中にエラー(段階: $stage)"
         return $null
+    } finally {
+        # 次のメール(または呼び出し元)のログが、このメールのコンテキストへ混入しないようにする
+        End-MailLogContext
     }
 }
 
@@ -665,8 +830,6 @@ $errorCount = 0
 $processedFolders = @()
 
 try {
-    Initialize-LogFile
-
     Write-Log "============================================" -Level Info
     Write-Log "Outlookメール保存ツール 開始" -Level Info
     Write-Log "============================================" -Level Info
@@ -676,10 +839,11 @@ try {
     if (-not $edgePath) {
         Write-Log "Microsoft Edgeが見つかりません。" -Level Error
         Write-Log "Edgeをインストールするか、パスを確認してください。" -Level Error
+        Save-PendingLogToDesktop -Reason "起動時エラー: Edgeが見つからない"
         exit 1
     }
     Write-Log "Edge: $edgePath" -Level Info
-    
+
     # Outlook接続
     try {
         $outlook = [System.Runtime.InteropServices.Marshal]::GetActiveObject("Outlook.Application")
@@ -687,6 +851,7 @@ try {
     } catch {
         Write-Log "Outlookが起動していません。" -Level Error
         Write-Log "Outlookを起動してメールを選択してから実行してください。" -Level Error
+        Save-PendingLogToDesktop -Reason "起動時エラー: Outlookに接続できない"
         exit 1
     }
 
@@ -702,55 +867,57 @@ try {
     Write-Log "選択メール: $($selection.Count) 件" -Level Info
     Write-Log "--------------------------------------------" -Level Info
 
-    # メール処理ループ
+    # メール処理ループ（各メールのログはそのメールの保存フォルダ内へ個別に保存される）
     $mailIndex = 0
     foreach ($mail in $selection) {
         $mailIndex++
-        
+
         try {
             $outputDir = Process-SingleMail -mail $mail -index $mailIndex -total $selection.Count -edgePath $edgePath
-            
+
             if ($outputDir) {
                 $processedFolders += $outputDir
                 $processedCount++
             } else {
                 $errorCount++
             }
-            
+
         } catch {
-            Write-ErrorDetail -MailSubject "(不明)" -Stage "メール処理(予期しないエラー)" -ErrorRecord $_
+            Write-ErrorDetailWithFallback -MailSubject "(不明)" -Stage "メール処理(予期しないエラー)" -ErrorRecord $_ `
+                -FallbackReason "メール処理中に予期しないエラー"
             $errorCount++
         }
     }
 
-    # 処理完了サマリー（コンソール・ログファイルとも、ここで1回だけ表示する）
-    Write-Log "============================================" -Level Info
-    Write-Log "処理完了" -Level Success
-    Write-Log "  成功: $processedCount 件" -Level Success
-    Write-Log "  失敗: $errorCount 件" -Level $(if ($errorCount -gt 0) { 'Warning' } else { 'Success' })
-    if ($script:LogFilePath) {
-        Write-Log "  ログ: $script:LogFilePath" -Level Info
-    }
-    Write-Log "============================================" -Level Info
+    # 処理完了サマリー（ログは各メールの保存フォルダ内に個別にあるため、ここはコンソール表示のみ）
+    End-MailLogContext
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Green
+    Write-Host "処理完了" -ForegroundColor Green
+    Write-Host "  成功: $processedCount 件" -ForegroundColor Green
+    Write-Host "  失敗: $errorCount 件" -ForegroundColor $(if ($errorCount -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Host "============================================" -ForegroundColor Green
 
     # フォルダ自動オープン
     if ($CONFIG.OpenFolderAfterProcess -and $processedFolders.Count -gt 0) {
         Start-Sleep -Milliseconds 500
         if ($processedFolders.Count -eq 1) {
-            Write-Log "保存フォルダを開きます..." -Level Info
             Invoke-Item -LiteralPath $processedFolders[0]
         } else {
-            Write-Log "デスクトップを開きます..." -Level Info
             Invoke-Item -LiteralPath $CONFIG.DesktopPath
         }
     }
 
 } catch {
+    # メール処理ループの外で起きた予期しないエラー。特定のメールの保存フォルダに紐づかないため
+    # 必ずデスクトップへ退避する。ここまでに蓄積した共通ログ(Outlook接続確認・選択メール件数等)を
+    # 消さずに残すため、CurrentLogFilePathだけを念のため無効化する(Reset-MailLogContextは呼ばない)。
+    $script:CurrentLogFilePath = $null
     Write-ErrorDetail -MailSubject "(不明)" -Stage "スクリプト全体(予期しないエラー)" -ErrorRecord $_
+    Save-PendingLogToDesktop -Reason "スクリプト全体で予期しないエラー"
     exit 1
 } finally {
     # COM解放
-    Write-Log "クリーンアップ中..." -Level Info
     Release-Ref $selection
     Release-Ref $explorer
     Release-Ref $outlook
