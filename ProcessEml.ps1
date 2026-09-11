@@ -622,6 +622,91 @@ $footerHtml
     return "<html><head>$headInsert</head>" + $htmlBody + "</html>"
 }
 
+function Get-EdgeVersionString {
+    # PDF変換失敗時の切り分け用に、実際に使われているmsedge.exeのファイルバージョンを取得する。
+    # 取得に失敗してもメール処理自体は止めない。
+    param([string]$EdgePath)
+    try {
+        return ([System.Diagnostics.FileVersionInfo]::GetVersionInfo($EdgePath)).FileVersion
+    } catch {
+        return $null
+    }
+}
+
+function Get-EdgePolicyDiagnostics {
+    # 組織ポリシー(HKLM/HKCU\SOFTWARE\Policies\Microsoft\Edge)のUserDataDir/PrintingEnabledを確認する。
+    # UserDataDirがポリシーで固定されていると、コマンドラインの--user-data-dir指定が無視され、
+    # 起動中の通常Edgeへコマンドラインが転送されて何もせずExitCode 0で終了することがあるため、
+    # PDF変換失敗時の切り分けに使う。レジストリ確認に失敗してもメール処理自体は止めない。
+    $hives = @(
+        @{ Name = "HKLM"; Path = "HKLM:\SOFTWARE\Policies\Microsoft\Edge" }
+        @{ Name = "HKCU"; Path = "HKCU:\SOFTWARE\Policies\Microsoft\Edge" }
+    )
+    $result = [ordered]@{}
+    foreach ($hive in $hives) {
+        try {
+            if (Test-Path -LiteralPath $hive.Path) {
+                $props = Get-ItemProperty -LiteralPath $hive.Path -ErrorAction Stop
+                $result["$($hive.Name)_UserDataDir"] = if ($null -ne $props.PSObject.Properties['UserDataDir']) { $props.UserDataDir } else { "(未設定)" }
+                $result["$($hive.Name)_PrintingEnabled"] = if ($null -ne $props.PSObject.Properties['PrintingEnabled']) { $props.PrintingEnabled } else { "(未設定)" }
+            } else {
+                $result["$($hive.Name)_UserDataDir"] = "(ポリシーキーなし)"
+                $result["$($hive.Name)_PrintingEnabled"] = "(ポリシーキーなし)"
+            }
+        } catch {
+            $result["$($hive.Name)_UserDataDir"] = "(確認失敗: $_)"
+            $result["$($hive.Name)_PrintingEnabled"] = "(確認失敗: $_)"
+        }
+    }
+    return $result
+}
+
+function Test-EdgeProfileCreated {
+    # 一時UserDataDir配下に実際にEdgeがプロファイルを作成した形跡(何らかのファイル/フォルダ)があるかを確認する。
+    # --user-data-dirを指定してもここが空のままなら、指定が無視された(=別プロセスへ転送された)疑いが強い。
+    param([string]$UserDataDir)
+    try {
+        if (-not (Test-Path -LiteralPath $UserDataDir)) { return $false }
+        $items = Get-ChildItem -LiteralPath $UserDataDir -ErrorAction SilentlyContinue
+        return ($null -ne $items -and @($items).Count -gt 0)
+    } catch {
+        return $false
+    }
+}
+
+function Write-EdgePdfFailureDiagnostics {
+    # PDF変換失敗時のみ呼び出す切り分け用ログ。成功時には出力しない。
+    param(
+        [string]$EdgePath,
+        [string[]]$ArgList,
+        [string]$UserDataDir,
+        [int]$ExistingEdgeProcessCountBefore
+    )
+
+    Write-Log "  Edge実行ファイル: $EdgePath" -Level Error
+
+    $version = Get-EdgeVersionString -EdgePath $EdgePath
+    Write-Log "  Edge Version: $(if ($version) { $version } else { '(取得失敗)' })" -Level Error
+
+    $policy = Get-EdgePolicyDiagnostics
+    Write-Log "  Edge Policy UserDataDir (HKLM): $($policy.HKLM_UserDataDir)" -Level Error
+    Write-Log "  Edge Policy UserDataDir (HKCU): $($policy.HKCU_UserDataDir)" -Level Error
+    Write-Log "  Edge Policy PrintingEnabled (HKLM): $($policy.HKLM_PrintingEnabled)" -Level Error
+    Write-Log "  Edge Policy PrintingEnabled (HKCU): $($policy.HKCU_PrintingEnabled)" -Level Error
+
+    Write-Log "  Edge起動引数: $($ArgList -join ' ')" -Level Error
+
+    try {
+        $afterCount = (Get-Process -Name "msedge" -ErrorAction SilentlyContinue | Measure-Object).Count
+    } catch {
+        $afterCount = -1
+    }
+    Write-Log "  既存msedgeプロセス数(起動前/終了後): $ExistingEdgeProcessCountBefore / $afterCount" -Level Error
+
+    $profileCreated = Test-EdgeProfileCreated -UserDataDir $UserDataDir
+    Write-Log "  一時UserDataDirへのプロファイル作成有無: $profileCreated ($UserDataDir)" -Level Error
+}
+
 function Invoke-EdgePrintToPdf {
     param(
         [string]$EdgePath,
@@ -638,6 +723,9 @@ function Invoke-EdgePrintToPdf {
     $stdErr = ""
     $exitCode = $null
 
+    $argList = $null
+    $existingEdgeProcessCountBefore = -1
+
     try {
         $argList = @(
             "--headless"
@@ -645,8 +733,9 @@ function Invoke-EdgePrintToPdf {
             "--disable-software-rasterizer"
             "--disable-dev-shm-usage"
             "--run-all-compositor-stages-before-draw"
-            "--log-level=3"
-            "--disable-logging"
+            # --disable-loggingと--log-level=3(FATALのみ)は失敗原因の切り分けを妨げるため外し、
+            # 代わりにstderrへログを出す。成功時はこの内容を参照しないため出力コストは無視できる。
+            "--enable-logging=stderr"
             "--no-sandbox"
             "--no-first-run"
             "--no-default-browser-check"
@@ -665,6 +754,15 @@ function Invoke-EdgePrintToPdf {
         $processInfo.RedirectStandardError = $true
         $processInfo.CreateNoWindow = $true
 
+        # 失敗時に「起動前から既にEdgeが動いていたか」を判定するための基準値
+        # (UserDataDirポリシーで--user-data-dirが無視され、既存Edgeへコマンドラインが
+        # 転送されて何もせずExitCode 0で終わるケースを切り分けるため)
+        try {
+            $existingEdgeProcessCountBefore = (Get-Process -Name "msedge" -ErrorAction SilentlyContinue | Measure-Object).Count
+        } catch {
+            $existingEdgeProcessCountBefore = -1
+        }
+
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         $process.Start() | Out-Null
@@ -678,8 +776,9 @@ function Invoke-EdgePrintToPdf {
             try { $process.Kill() } catch {}
             try { $stdOut = $stdOutTask.Result } catch {}
             try { $stdErr = $stdErrTask.Result } catch {}
-            Write-Log "  Edge実行ファイル: $EdgePath" -Level Error
             Write-Log "  PDF変換タイムアウト（$($CONFIG.PdfTimeout)秒）" -Level Error
+            Write-EdgePdfFailureDiagnostics -EdgePath $EdgePath -ArgList $argList -UserDataDir $UserDataDir `
+                                            -ExistingEdgeProcessCountBefore $existingEdgeProcessCountBefore
             if ($stdErr) { Write-Log "  StandardError: $stdErr" -Level Error }
             if ($stdOut) { Write-Log "  StandardOutput: $stdOut" -Level Error }
             return $false
@@ -702,17 +801,19 @@ function Invoke-EdgePrintToPdf {
         }
 
         # 失敗時のみ、原因追跡に必要な情報を記録する（成功時は残さない）
-        Write-Log "  Edge実行ファイル: $EdgePath" -Level Error
         Write-Log "  Edge ExitCode: $exitCode" -Level Error
         Write-Log "  PDF出力ファイルの存在: $([System.IO.File]::Exists($PdfPath))" -Level Error
         Write-Log "  PDF出力ファイルサイズ: $pdfSize" -Level Error
+        Write-EdgePdfFailureDiagnostics -EdgePath $EdgePath -ArgList $argList -UserDataDir $UserDataDir `
+                                        -ExistingEdgeProcessCountBefore $existingEdgeProcessCountBefore
         if ($stdErr) { Write-Log "  StandardError: $stdErr" -Level Error }
         if ($stdOut) { Write-Log "  StandardOutput: $stdOut" -Level Error }
         return $false
 
     } catch {
         Write-Log "  PDF変換処理でエラー: $_" -Level Error
-        Write-Log "  Edge実行ファイル: $EdgePath" -Level Error
+        Write-EdgePdfFailureDiagnostics -EdgePath $EdgePath -ArgList $argList -UserDataDir $UserDataDir `
+                                        -ExistingEdgeProcessCountBefore $existingEdgeProcessCountBefore
         return $false
     } finally {
         if ($process) {
