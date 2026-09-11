@@ -62,7 +62,6 @@ Outlook で選択したメールを、件名・差出人・宛先などのヘッ
 | `MaxSubjectLength` | フォルダ名に使う件名の最大文字数 | `200` |
 | `MaxSenderLength` | PDFファイル名に使う差出人名の最大文字数 | `50` |
 | `MaxPathLength` | 保存先パスの最大長（超過時は自動短縮） | `240` |
-| `WordExportTimeoutSec` | Word COMによるPDF変換のタイムアウト秒数（ダイアログ表示等でWordが応答しなくなった場合に処理を打ち切るための上限） | `60` |
 | `OpenFolderAfterProcess` | 処理完了後に保存先フォルダを自動で開くか | `$true` |
 | `EnableLogging` | 処理ログをファイルに残すか（`$false` の場合はログファイルを作成しない） | `$true` |
 
@@ -70,10 +69,11 @@ Outlook で選択したメールを、件名・差出人・宛先などのヘッ
 
 - 件名や差出人名に含まれる `\ / : * ? " < > \|` は、Windowsのファイル名で使用できないため全角文字に置換して保存される（`[` `]` はファイル名として有効なため置換されない）
 - PDF変換には Microsoft Word（デスクトップ版）の COM オートメーション（`ExportAsFixedFormat`）を使用する
-  - 変換のたびに新規の `Word.Application` インスタンスをバックグラウンドで起動して使い切り、画面には表示しない（`Visible = $false`）
-  - 正常時・異常時とも `Document.Close` → `Word.Application.Quit` → `Marshal.ReleaseComObject` → GC による通常のCOM解放だけで完結させ、`Get-Process WINWORD` の前後比較のような間接的な判定でプロセスを終了することはない
-  - 変換がタイムアウトした場合に限り、mailexporter が生成した `Word.Application` インスタンス自身のプロセスIDを起動直後に記録しておいた情報をもとに、そのプロセスであると確認できた場合のみ終了する。PIDを確実に特定できない場合は、誤って利用者のWordを終了するより残留の可能性をログへ記録するだけに留める
-  - 利用者が別途 Word を手作業で開いたままでも実行でき、そちらの Word を終了させることはない
+  - `Word.Application` は実行全体（選択した全メールの処理）を通して1つのインスタンスだけを起動し、メールごとに起動・終了はしない（Word自体の起動コストは初回の1回のみ）
+  - 画面には表示しない（`Visible = $false`、`DisplayAlerts = 0`、`AutomationSecurity = 3`）
+  - メールごとの `Document` は開いたら必ずその場で `Close` する。`Word.Application` 自体の `Quit`／COM解放はスクリプト全体の終了処理（`finally`）でのみ行う
+  - 1通のメールでPDF変換に失敗した場合、Word自体が引き続き使える状態であれば残りのメールの処理を継続する。COM接続が失われていると判断できた場合のみ、以降のメール処理を安全に打ち切る
+  - 利用者が別途 Word を手作業で開いたままでも実行でき、そちらの Word を取得・終了することはない（mailexporter が自ら `New-Object -ComObject Word.Application` で生成したインスタンスのみを使用する）
   - Word がインストールされていない、または起動できない場合はエラーとして記録し、処理を中止する（他の変換方式への自動切り替えは行わない）
 - HTML／PDF変換はいずれも `%TEMP%\MailExporter\{GUID}\` の短い一時フォルダ内だけで完結させ、完成したPDFのみを `.NET` のファイルAPIでメール保存フォルダへ移動する（件名等の長い/特殊文字を含むパスをWordへ直接渡さないため）
 - 会議出席依頼や連絡先など、メール以外のアイテムを一緒に選択していた場合は処理対象外としてスキップされる（失敗としては数えない）
