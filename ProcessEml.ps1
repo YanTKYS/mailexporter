@@ -544,19 +544,49 @@ function Process-SingleMail {
     $pdfPath = Join-Path $outputDir $pdfName
     
     Write-Log "  PDF変換中..." -Level Info
-    
+
+    $pdfResult = $false
+    $pdfException = $null
+
     try {
-        $pdfResult = Convert-HtmlToPdf -HtmlPath $tempHtml -PdfPath $pdfPath -EdgePath $edgePath
-        
+        try {
+            $pdfResult = Convert-HtmlToPdf -HtmlPath $tempHtml -PdfPath $pdfPath -EdgePath $edgePath
+        } catch {
+            $pdfException = $_
+        }
+
+        if (-not $pdfResult) {
+            # 1回目の失敗はまれに再発することが実機で確認されているため、1回だけ自動で再試行する
+            Write-Log "  PDF変換に失敗したため1回だけ再試行します..." -Level Warning
+            Start-Sleep -Seconds 1
+
+            # 1回目の失敗で不完全なPDFが作成されている可能性があるため、再試行前に削除する
+            # (保存先パスに '[' ']' 等が含まれていてもワイルドカードとして誤解釈されないよう -LiteralPath で行う)
+            if (Test-Path -LiteralPath $pdfPath) {
+                Remove-Item -LiteralPath $pdfPath -Force -ErrorAction SilentlyContinue
+            }
+
+            $pdfException = $null
+            try {
+                $pdfResult = Convert-HtmlToPdf -HtmlPath $tempHtml -PdfPath $pdfPath -EdgePath $edgePath
+            } catch {
+                $pdfException = $_
+            }
+
+            if ($pdfResult) {
+                Write-Log "  PDF変換再試行: 成功" -Level Success
+            }
+        }
+
         if ($pdfResult) {
             Write-Log "  PDF作成: $pdfName" -Level Success
+        } elseif ($pdfException) {
+            Write-Log "  PDF変換エラー: $pdfException" -Level Error
+            return $null
         } else {
             Write-Log "  PDF生成失敗" -Level Error
             return $null
         }
-    } catch {
-        Write-Log "  PDF変換エラー: $_" -Level Error
-        return $null
     } finally {
         # 保存先フォルダ名に '[' ']' 等が含まれていてもワイルドカードとして
         # 誤解釈されないよう、存在確認・削除は -LiteralPath で行う
