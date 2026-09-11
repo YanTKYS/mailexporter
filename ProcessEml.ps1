@@ -615,41 +615,90 @@ $footerHtml
     return "<html><head>$headInsert</head>" + $htmlBody + "</html>"
 }
 
-function Stop-OrphanedWinwordProcesses {
-    # 変換ジョブ開始前に存在しなかったWINWORD.EXEだけを終了する。
-    # 利用者が別途手作業で開いているWordのプロセスは起動前から存在しているため対象外となる。
-    param([int[]]$BeforePids)
+function Stop-TimedOutWordProcess {
+    # タイムアウト時のみ呼び出す。「変換開始前後のWINWORD.EXE差分」のような推測では
+    # 利用者が別途開いたWordまで誤って終了させかねないため使用しない。
+    # 代わりに、ジョブ側がWord COMインスタンス生成直後に自ら記録した確定PID(PidFilePath)
+    # だけを根拠にし、かつ実際にWINWORD.EXEであることを再確認できた場合のみ終了する。
+    # PIDを確実に特定できない場合は、誤って利用者のWordを終了するより、
+    # 残留の可能性をログへ記録するだけに留める。
+    param([string]$PidFilePath)
 
+    $procId = 0
     try {
-        $current = Get-Process -Name "WINWORD" -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $PidFilePath) {
+            $pidText = ([System.IO.File]::ReadAllText($PidFilePath)).Trim()
+            [void][int]::TryParse($pidText, [ref]$procId)
+        }
     } catch {
+        $procId = 0
+    }
+
+    if ($procId -le 0) {
+        Write-Log "  タイムアウトしたWordプロセスを特定できなかったため終了しません。手動でのWord残留確認を推奨します。" -Level Warning
         return
     }
 
-    foreach ($p in $current) {
-        if ($BeforePids -notcontains $p.Id) {
-            try {
-                Write-Log "  残留したWord(PID:$($p.Id))を終了します" -Level Warning
-                $p.Kill()
-            } catch {
-                # 既に終了している場合などは無視
-            }
-        }
+    $proc = $null
+    try {
+        $proc = Get-Process -Id $procId -ErrorAction Stop
+    } catch {
+        Write-Log "  タイムアウトしたWordプロセス(PID:$procId)は既に終了していました" -Level Info
+        return
+    }
+
+    if ($proc.ProcessName -ne 'WINWORD') {
+        Write-Log "  記録されたPID($procId)がWINWORD.EXEではなかったため終了しません（現在: $($proc.ProcessName)）" -Level Warning
+        return
+    }
+
+    try {
+        Write-Log "  タイムアウトしたWord(PID:$procId)を終了します" -Level Warning
+        $proc.Kill()
+    } catch {
+        Write-Log "  タイムアウトしたWord(PID:$procId)の終了に失敗しました: $_" -Level Warning
     }
 }
 
 function Invoke-WordExportToPdf {
     # Word.Application COMでHTMLをPDFへ変換する。
-    # ダイアログ表示等でWordが応答しなくなった場合にmailexporter自体が無期限に停止しないよう、
-    # 実際のCOM操作は別プロセス(バックグラウンドジョブ)内で行い、タイムアウト時は
-    # このジョブが起動したWINWORD.EXEだけを終了させる。
+    # 正常時・異常時とも、原則としてDocument.Close/Word.Application.Quit/
+    # Marshal.ReleaseComObject/GCによる通常のCOM解放だけで完結させる
+    # (WINWORD.EXEの存在有無を見て終了させる、といった間接的な判定は行わない)。
+    #
+    # ダイアログ表示等でWordが応答しなくなった場合にmailexporter自体が無期限に
+    # 停止しないよう、実際のCOM操作は別プロセス(バックグラウンドジョブ)内で行う。
+    # そのタイムアウト時に限り、ジョブ側がWord COMインスタンス生成直後に
+    # PidFilePathへ記録した確定PIDだけを対象に終了を試みる(Stop-TimedOutWordProcess)。
     param(
         [string]$HtmlPath,
-        [string]$PdfPath
+        [string]$PdfPath,
+        [string]$PidFilePath
     )
 
     $wordJobScript = {
-        param($HtmlPath, $PdfPath)
+        param($HtmlPath, $PdfPath, $PidFilePath)
+
+        # ジョブは別プロセスで動くため、PID特定用のWin32 APIをこのプロセス内で定義する
+        try {
+            Add-Type -Namespace MailExporter -Name NativeMethods -MemberDefinition @"
+[DllImport("user32.dll")]
+public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+"@ -ErrorAction Stop
+        } catch {}
+
+        function Write-WordProcessIdIfPossible {
+            param($WordApp, [string]$PidFilePath)
+            try {
+                $hwnd = [IntPtr]$WordApp.Hwnd
+                if ($hwnd -eq [IntPtr]::Zero) { return }
+                $procId = [uint32]0
+                [void][MailExporter.NativeMethods]::GetWindowThreadProcessId($hwnd, [ref]$procId)
+                if ($procId -gt 0) {
+                    [System.IO.File]::WriteAllText($PidFilePath, $procId.ToString())
+                }
+            } catch {}
+        }
 
         $word = $null
         $doc = $null
@@ -666,8 +715,16 @@ function Invoke-WordExportToPdf {
             # (メール本文のHTMLにマクロは含まれないが、念のための対策)
             try { $word.AutomationSecurity = 3 } catch {}
 
+            # タイムアウト発生時に「このジョブが起動したWord」だけを特定できるよう、
+            # できるだけ早い時点でPIDを記録しておく
+            Write-WordProcessIdIfPossible -WordApp $word -PidFilePath $PidFilePath
+
             # ConfirmConversions:$false でHTML読み込み時の変換確認ダイアログを抑止する
             $doc = $word.Documents.Open($HtmlPath, $false, $true, $false)
+
+            # Open前に取得できなかった場合の再試行(ウィンドウはOpen後には確実に存在する)
+            Write-WordProcessIdIfPossible -WordApp $word -PidFilePath $PidFilePath
+
             $doc.ExportAsFixedFormat($PdfPath, 17)
 
             return @{ Success = $true }
@@ -687,8 +744,7 @@ function Invoke-WordExportToPdf {
         }
     }
 
-    $beforePids = @(Get-Process -Name "WINWORD" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
-    $job = Start-Job -ScriptBlock $wordJobScript -ArgumentList $HtmlPath, $PdfPath
+    $job = Start-Job -ScriptBlock $wordJobScript -ArgumentList $HtmlPath, $PdfPath, $PidFilePath
 
     try {
         $completed = Wait-Job -Job $job -Timeout $CONFIG.WordExportTimeoutSec
@@ -696,7 +752,7 @@ function Invoke-WordExportToPdf {
         if (-not $completed) {
             Write-Log "  Word変換がタイムアウトしました（$($CONFIG.WordExportTimeoutSec)秒）" -Level Error
             try { Stop-Job -Job $job -ErrorAction SilentlyContinue } catch {}
-            Stop-OrphanedWinwordProcesses -BeforePids $beforePids
+            Stop-TimedOutWordProcess -PidFilePath $PidFilePath
             return @{ Success = $false; ErrorType = 'Timeout'; Message = "Word変換がタイムアウトしました" }
         }
 
@@ -710,9 +766,8 @@ function Invoke-WordExportToPdf {
             $result = @{ Success = $false; ErrorType = 'Unknown'; Message = "Word変換ジョブから結果を取得できませんでした" }
         }
 
-        # ジョブ内で確実にQuitしているはずだが、取りこぼしが無いか念のため確認する
-        Stop-OrphanedWinwordProcesses -BeforePids $beforePids
-
+        # 正常にジョブが完了した場合、Word側は既に自身のfinally内でClose/Quit/COM解放を
+        # 完了しているはずであり、ここでの追加のプロセス終了処理は行わない。
         return $result
     } finally {
         try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch {}
@@ -734,10 +789,11 @@ function Convert-MailHtmlToPdf {
 
         $tempHtmlPath = Join-Path $tempWorkDir "mail.html"
         $tempPdfPath = Join-Path $tempWorkDir "mail.pdf"
+        $tempPidPath = Join-Path $tempWorkDir "word.pid"
 
         [System.IO.File]::WriteAllText($tempHtmlPath, $Html, [System.Text.Encoding]::UTF8)
 
-        $result = Invoke-WordExportToPdf -HtmlPath $tempHtmlPath -PdfPath $tempPdfPath
+        $result = Invoke-WordExportToPdf -HtmlPath $tempHtmlPath -PdfPath $tempPdfPath -PidFilePath $tempPidPath
 
         if (-not $result.Success) {
             if ($result.ErrorType -eq 'WordNotAvailable') {
@@ -877,20 +933,28 @@ try {
     Write-Log "============================================" -Level Info
 
     # Word確認（実際にCOMインスタンスを生成できるかを確認し、確認用インスタンスは即座に終了する）
+    # 生成後に例外が発生してもWordが残らないよう、Quit/COM解放はtry/finallyで確実に行う
+    $wordProbe = $null
     try {
-        $wordProbe = New-Object -ComObject Word.Application
+        try {
+            $wordProbe = New-Object -ComObject Word.Application
+        } catch {
+            Write-Log "Microsoft Wordを起動できませんでした。" -Level Error
+            Write-Log "Microsoft Wordがインストールされていることを確認してください。" -Level Error
+            Save-PendingLogToDesktop -Reason "起動時エラー: Wordを起動できない"
+            exit 1
+        }
+
         $wordProbe.Visible = $false
         $wordProbe.DisplayAlerts = 0
-        $wordProbe.Quit()
-        Release-Ref $wordProbe
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
         Write-Log "Word接続確認: 成功" -Level Success
-    } catch {
-        Write-Log "Microsoft Wordを起動できませんでした。" -Level Error
-        Write-Log "Microsoft Wordがインストールされていることを確認してください。" -Level Error
-        Save-PendingLogToDesktop -Reason "起動時エラー: Wordを起動できない"
-        exit 1
+    } finally {
+        if ($wordProbe) {
+            try { $wordProbe.Quit() } catch {}
+            Release-Ref $wordProbe
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+        }
     }
 
     # Outlook接続
