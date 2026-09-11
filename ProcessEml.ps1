@@ -19,6 +19,9 @@ $CONFIG = @{
     PdfMinFileSize = 100
     PdfRetryCount = 10
     PdfRetryInterval = 500
+    # タイムアウトでEdgeをKillした後、StandardOutput/StandardErrorの取得を待つ上限(ミリ秒)。
+    # Process.Kill()はEdgeの子孫プロセスまで確実に終了させないため、無期限待機を避けるための上限。
+    PdfKillOutputWaitMs = 3000
     # Outlook設定
     OutlookMailItemClass = 43
 }
@@ -707,6 +710,26 @@ function Write-EdgePdfFailureDiagnostics {
     Write-Log "  一時UserDataDirへのプロファイル作成有無: $profileCreated ($UserDataDir)" -Level Error
 }
 
+function Get-ProcessOutputTaskTextOrTimeout {
+    # Process.Kill()はEdgeの子孫プロセス(GPU/レンダラー等)まで確実に終了させる保証がないため、
+    # 終了後もリダイレクトされたパイプの書き込み側ハンドルが残り、
+    # ReadToEndAsync().Resultが無期限にブロックする恐れがある。
+    # そのため有限時間だけ待ち、完了しなければ待たずに切り上げる。
+    param(
+        [System.Threading.Tasks.Task[string]]$Task,
+        [int]$TimeoutMilliseconds
+    )
+    if (-not $Task) { return "" }
+    try {
+        if ($Task.Wait($TimeoutMilliseconds)) {
+            return $Task.Result
+        }
+    } catch {
+        return "(取得失敗: $_)"
+    }
+    return "(取得タイムアウト: $TimeoutMilliseconds ミリ秒以内に完了しませんでした)"
+}
+
 function Invoke-EdgePrintToPdf {
     param(
         [string]$EdgePath,
@@ -774,8 +797,10 @@ function Invoke-EdgePrintToPdf {
 
         if (-not $exited) {
             try { $process.Kill() } catch {}
-            try { $stdOut = $stdOutTask.Result } catch {}
-            try { $stdErr = $stdErrTask.Result } catch {}
+            # Kill()後もEdgeの子孫プロセスがパイプを保持している可能性があるため、
+            # ここで無期限に待たず、有限時間で取得を打ち切る
+            $stdOut = Get-ProcessOutputTaskTextOrTimeout -Task $stdOutTask -TimeoutMilliseconds $CONFIG.PdfKillOutputWaitMs
+            $stdErr = Get-ProcessOutputTaskTextOrTimeout -Task $stdErrTask -TimeoutMilliseconds $CONFIG.PdfKillOutputWaitMs
             Write-Log "  PDF変換タイムアウト（$($CONFIG.PdfTimeout)秒）" -Level Error
             Write-EdgePdfFailureDiagnostics -EdgePath $EdgePath -ArgList $argList -UserDataDir $UserDataDir `
                                             -ExistingEdgeProcessCountBefore $existingEdgeProcessCountBefore
