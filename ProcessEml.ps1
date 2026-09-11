@@ -1,5 +1,5 @@
 ﻿# ============================================
-# Outlookメール保存ツール（Wordセクション対策版）
+# Outlookメール保存ツール（Word文書直接生成版）
 # ============================================
 
 # --- 設定 ---
@@ -265,18 +265,6 @@ function Release-Ref {
     }
 }
 
-function Escape-HtmlText {
-    param([string]$text)
-    
-    if ([string]::IsNullOrEmpty($text)) { return "" }
-    
-    return $text -replace '&', '&amp;' `
-                -replace '<', '&lt;' `
-                -replace '>', '&gt;' `
-                -replace '"', '&quot;' `
-                -replace "'", '&#39;'
-}
-
 # ============================================
 # メール情報取得関数
 # ============================================
@@ -389,225 +377,112 @@ function Save-MailAttachments {
 }
 
 # ============================================
-# HTML・PDF生成関数（Wordセクション対策強化）
+# Word文書生成関数（Wordオブジェクトモデルで直接組み立てる）
 # ============================================
+# HTMLをWordに読み込ませる方式(Documents.Open)は、メールのHTML内容によっては
+# Wordの変換フィルタが極端に長時間応答しなくなることが実機で確認されたため採用しない。
+# 元メールのHTML装飾の完全な再現は目的とせず、件名・差出人・宛先・CC・受信日時・
+# 本文・添付一覧という文字情報を、Documents.Add()で作成した新規文書へ
+# Selection.TypeText/TypeParagraphで直接書き込むことで、安定した速度でPDF化する。
 
-function Get-MailHeaderHtml {
-    param($metadata)
-    
-    # 改ページ対策CSS
-    return @"
-<div style="border: 1px solid #000; padding: 10px; margin-bottom: 10px; font-family: 'BIZ UDGothic', 'Meiryo', 'Yu Gothic', sans-serif; page-break-inside: avoid; break-inside: avoid; page-break-after: avoid; break-after: avoid;">
-    <table style="width: 100%; border-collapse: collapse; font-size: 10pt;">
-        <tr>
-            <td style="padding: 1px; width: 90px; font-weight: bold; border-bottom: 1px solid #ccc;">件名</td>
-            <td style="padding: 1px; border-bottom: 1px solid #ccc;">$(Escape-HtmlText $metadata.Subject)</td>
-        </tr>
-        <tr>
-            <td style="padding: 1px; font-weight: bold; border-bottom: 1px solid #ccc;">差出人</td>
-            <td style="padding: 1px; border-bottom: 1px solid #ccc;">$(Escape-HtmlText $metadata.SenderInfo)</td>
-        </tr>
-        <tr>
-            <td style="padding: 1px; font-weight: bold; border-bottom: 1px solid #ccc;">宛先</td>
-            <td style="padding: 1px; border-bottom: 1px solid #ccc;">$(Escape-HtmlText $metadata.ToAddr)</td>
-        </tr>
-        <tr>
-            <td style="padding: 1px; font-weight: bold; border-bottom: 1px solid #ccc;">CC</td>
-            <td style="padding: 1px; border-bottom: 1px solid #ccc;">$(Escape-HtmlText $metadata.CcAddr)</td>
-        </tr>
-        <tr>
-            <td style="padding: 1px; font-weight: bold;">受信日時</td>
-            <td style="padding: 1px;">$($metadata.DateTimeStr)</td>
-        </tr>
-    </table>
-</div>
-"@
+function ConvertTo-WordParagraphText {
+    # TypeTextはChr(13)(`r)を含む文字列を渡すと、そこで改段落しつつ1回のCOM呼び出しで
+    # まとめて挿入できる。行ごとにTypeText/TypeParagraphを呼び返す方式は、
+    # 長文メールで往復回数が増えて遅くなるため採らない。
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) { return "" }
+    return (($Text -replace "`r`n", "`r") -replace "`n", "`r")
 }
 
-function Get-MailFooterHtml {
-    param([array]$attachmentNames)
-    
-    $attListStr = if ($attachmentNames.Count -gt 0) {
-        ($attachmentNames | ForEach-Object { "• $_" }) -join "<br>"
+function Write-MailHeaderLine {
+    # ラベル部分だけ太字にして1行で書き込む(表は使わず、安定して確実なAPIのみで組み立てる)
+    param($Selection, [string]$Label, [string]$Value)
+
+    $safeValue = ($Value -replace '[\r\n]+', ' ')
+
+    $Selection.Font.Bold = $true
+    $Selection.TypeText("${Label}: ")
+    $Selection.Font.Bold = $false
+    $Selection.TypeText($safeValue)
+    $Selection.TypeParagraph()
+}
+
+function New-MailWordDocument {
+    # Word.Applicationインスタンス(呼び出し元で使い回している1つのインスタンス)上に
+    # 新規文書を1つ作成し、指定様式の内容を書き込んで返す。呼び出し元でClose/Export/移動を行う。
+    param(
+        $WordApp,
+        $Metadata,
+        [string]$BodyText,
+        [array]$AttachmentNames
+    )
+
+    $doc = $WordApp.Documents.Add()
+
+    try {
+        $doc.PageSetup.TopMargin = $WordApp.CentimetersToPoints(2.0)
+        $doc.PageSetup.BottomMargin = $WordApp.CentimetersToPoints(2.0)
+        $doc.PageSetup.LeftMargin = $WordApp.CentimetersToPoints(2.5)
+        $doc.PageSetup.RightMargin = $WordApp.CentimetersToPoints(2.5)
+    } catch {
+        # 余白調整はレイアウト上の見た目の問題に留まるため、失敗しても変換自体は継続する
+    }
+
+    $sel = $WordApp.Selection
+    $sel.Font.Name = 'Yu Gothic'
+    $sel.Font.Size = 10.5
+    $sel.Font.Bold = $false
+
+    # 件名（本文より大きく太字の見出しとして扱う）
+    $subjectLine = ($Metadata.Subject -replace '[\r\n]+', ' ')
+    $sel.Font.Size = 15
+    $sel.Font.Bold = $true
+    $sel.TypeText($subjectLine)
+    $sel.TypeParagraph()
+
+    $sel.Font.Size = 10.5
+    $sel.Font.Bold = $false
+    $sel.TypeParagraph()
+
+    # ヘッダー情報（差出人・宛先・CC・受信日時を上部に整理）
+    Write-MailHeaderLine -Selection $sel -Label '差出人' -Value $Metadata.SenderInfo
+    Write-MailHeaderLine -Selection $sel -Label '宛先' -Value $Metadata.ToAddr
+    Write-MailHeaderLine -Selection $sel -Label 'CC' -Value $Metadata.CcAddr
+    Write-MailHeaderLine -Selection $sel -Label '受信日時' -Value $Metadata.DateTimeStr
+
+    # ヘッダー情報と本文の区切り
+    $sel.TypeParagraph()
+    $sel.Font.Size = 8
+    $sel.TypeText([string]::new([char]0x2015, 50))
+    $sel.TypeParagraph()
+    $sel.Font.Size = 10.5
+    $sel.TypeParagraph()
+
+    # 本文（原則としてMailItem.Bodyをそのまま使用し、装飾再現より文字情報の保持を優先する）
+    $bodyToWrite = if ([string]::IsNullOrEmpty($BodyText)) { "(本文なし)" } else { $BodyText }
+    $sel.TypeText((ConvertTo-WordParagraphText $bodyToWrite))
+    $sel.TypeParagraph()
+    $sel.TypeParagraph()
+
+    # 添付ファイル一覧（本文末尾）
+    $sel.Font.Bold = $true
+    $sel.Font.Size = 9.5
+    $sel.TypeText("添付ファイル:")
+    $sel.TypeParagraph()
+    $sel.Font.Bold = $false
+    $sel.Font.Size = 10
+
+    if ($AttachmentNames.Count -gt 0) {
+        $attachmentText = ($AttachmentNames | ForEach-Object { "・$_" }) -join "`r"
+        $sel.TypeText((ConvertTo-WordParagraphText $attachmentText))
+        $sel.TypeParagraph()
     } else {
-        "(添付ファイルなし)"
-    }
-    
-    return @"
-<div style="border-top: 1px solid #000; padding: 10px; margin-top: 10px; font-family: 'BIZ UDGothic', 'Meiryo', sans-serif; page-break-inside: avoid; break-inside: avoid; page-break-before: avoid; break-before: avoid;">
-    <div style="font-size: 9pt;">
-        <strong>添付ファイル:</strong><br>
-        <div style="margin-top: 5px; padding-left: 5px;">$attListStr</div>
-    </div>
-    <div style="margin-top: 10px; padding-top: 5px; border-top: 1px solid #ccc; font-size: 8pt; color: #666; text-align: right;">
-        保存日時: $(Get-Date -Format 'yyyy年MM月dd日 HH:mm:ss')
-    </div>
-</div>
-"@
-}
-
-function Get-HtmlDocumentStyle {
-    # 【Wordセクション対策】WordSection1に対する強力なリセット
-    return @"
-<style>
-    /* 用紙の余白設定：上部を10mmに縮小 */
-    @page { margin-top: 10mm; margin-bottom: 15mm; margin-left: 15mm; margin-right: 15mm; }
-    
-    /* 本文外側の余白を削除 */
-    body { margin: 0; padding: 0; page-break-inside: auto; }
-    
-    /* 強制改ページの無効化 */
-    p, div, table, h1, h2, h3, h4, h5, h6 {
-        page-break-before: auto !important;
-        break-before: auto !important;
+        $sel.TypeText("(添付ファイルなし)")
+        $sel.TypeParagraph()
     }
 
-    /* WordSection1対策 */
-    div.WordSection1 {
-        page: auto !important;
-        width: 100% !important;
-        margin: 0 !important;
-        padding: 0 !important;
-    }
-</style>
-"@
-}
-
-function Add-HtmlAfterTag {
-    param(
-        [string]$html,
-        [string]$tagPattern,
-        [string]$insertHtml
-    )
-
-    # -replace の置換文字列では "$1" などが特殊な意味を持ち、件名や添付ファイル名に
-    # "$" が含まれると内容が化けるため、挿入位置を求めて文字列連結で差し込む。
-    # 見つからない場合は $null を返す。
-    $tagMatch = [regex]::Match($html, $tagPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if (-not $tagMatch.Success) { return $null }
-
-    $insertPos = $tagMatch.Index + $tagMatch.Length
-    return $html.Substring(0, $insertPos) + $insertHtml + $html.Substring($insertPos)
-}
-
-function Add-HtmlBeforeTag {
-    param(
-        [string]$html,
-        [string]$tag,
-        [string]$insertHtml
-    )
-
-    # 閉じタグ(</body>など)の直前へ差し込む。見つからない場合は末尾に付ける。
-    $insertPos = $html.LastIndexOf($tag, [System.StringComparison]::OrdinalIgnoreCase)
-    if ($insertPos -lt 0) { return $html + $insertHtml }
-
-    return $html.Substring(0, $insertPos) + $insertHtml + $html.Substring($insertPos)
-}
-
-function New-TextMailHtml {
-    param(
-        $mail,
-        [string]$headerHtml,
-        [string]$footerHtml,
-        [string]$styleHtml,
-        [string]$title
-    )
-
-    $bodyText = if ([string]::IsNullOrEmpty($mail.Body)) { "(本文なし)" } else { $mail.Body }
-    $bodyEscaped = (Escape-HtmlText $bodyText) -replace "`r`n", "<br>" -replace "`n", "<br>"
-
-    return @"
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset='utf-8'>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>$title</title>
-    $styleHtml
-</head>
-<body style="font-family: 'Meiryo', 'MS Gothic', sans-serif;">
-$headerHtml
-<div style="background-color: white; padding: 10px; border: 1px solid #ddd; white-space: pre-wrap; line-height: 1.6; page-break-inside: auto;">
-$bodyEscaped
-</div>
-$footerHtml
-</body>
-</html>
-"@
-}
-
-function New-MailHtml {
-    param(
-        $mail,
-        $metadata,
-        [array]$attachmentNames
-    )
-
-    $headerHtml = Get-MailHeaderHtml -metadata $metadata
-    $footerHtml = Get-MailFooterHtml -attachmentNames $attachmentNames
-    $styleHtml = Get-HtmlDocumentStyle
-
-    $htmlBody = $mail.HTMLBody
-
-    # テキスト形式のメールは、こちらでHTMLを組み立てる
-    if ([string]::IsNullOrEmpty($htmlBody)) {
-        return New-TextMailHtml -mail $mail -headerHtml $headerHtml -footerHtml $footerHtml `
-                                -styleHtml $styleHtml -title (Escape-HtmlText $metadata.Subject)
-    }
-
-    # --- ここからHTML形式のメール ---
-
-    # 【Wordセクション対策】Wordが出力する @page WordSection1 は
-    # 不要な改ページや余白を発生させるため無効化する
-    $htmlBody = $htmlBody -replace "@page\s+WordSection1", "@page WordSection1_Disabled"
-    $htmlBody = $htmlBody -replace "page:\s*WordSection1;?", "page: auto;"
-
-    # 本文の <body> 直後にヘッダー、</body> の直前にフッターを差し込む
-    $wrapped = Add-HtmlAfterTag -html $htmlBody -tagPattern "<body[^>]*>" `
-                                -insertHtml "<div style='padding:10px; page-break-inside: auto;'>$headerHtml"
-
-    if (-not $wrapped) {
-        # <body>を持たない断片的なHTMLの場合は、完全なHTMLとして組み立て直す
-        return @"
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset='utf-8'>
-    $styleHtml
-</head>
-<body style="margin: 10px;">
-<div style="page-break-inside: auto;">
-$headerHtml
-$htmlBody
-$footerHtml
-</div>
-</body>
-</html>
-"@
-    }
-
-    $htmlBody = Add-HtmlBeforeTag -html $wrapped -tag "</body>" -insertHtml "$footerHtml</div>"
-
-    # 文字コード指定とページ設定用スタイルを <head> へ追加する
-    $headInsert = $styleHtml
-    if ($htmlBody -notmatch "charset\s*=\s*['""]?utf-8") {
-        $headInsert = "<meta charset='utf-8'>" + $styleHtml
-    }
-
-    $withHead = Add-HtmlAfterTag -html $htmlBody -tagPattern "<head[^>]*>" -insertHtml $headInsert
-    if ($withHead) {
-        return $withHead
-    }
-
-    # <head>が無い場合は、<html>の直後に<head>を作る
-    # (先頭に "<html><head>...</head>" を足すと<html>が二重になり不正なHTMLになるため)
-    $withHead = Add-HtmlAfterTag -html $htmlBody -tagPattern "<html[^>]*>" -insertHtml "<head>$headInsert</head>"
-    if ($withHead) {
-        return $withHead
-    }
-
-    # <html>も無い断片的なHTMLの場合のみ、完全なHTML文書として包む
-    return "<html><head>$headInsert</head>" + $htmlBody + "</html>"
+    return $doc
 }
 
 function Test-WordAppAlive {
@@ -624,33 +499,35 @@ function Test-WordAppAlive {
     }
 }
 
-function Convert-MailHtmlToPdf {
-    # 引数で渡されたWord.Applicationインスタンス(処理全体で使い回す1つのインスタンス)を用いて
-    # HTMLをPDFへ変換する。Word自体の起動・終了はここでは行わない。
+function Convert-MailToPdf {
+    # 引数で渡されたWord.Applicationインスタンス(処理全体で使い回す1つのインスタンス)上に
+    # 新規文書を作成してPDFへ変換する。Word自体の起動・終了はここでは行わない。
     param(
-        [string]$Html,
+        $Metadata,
+        [string]$BodyText,
+        [array]$AttachmentNames,
         [string]$FinalPdfPath,
         $WordApp
     )
 
-    # 件名等の利用者由来の長い/特殊文字を含むパスをWordへ直接渡さないよう、
-    # %TEMP%\MailExporter\{GUID}\ の短い一時フォルダ内だけで変換を完結させる。
+    # 完成したPDFのみを、利用者由来の長い/特殊文字を含み得る最終保存フォルダへ移動する。
+    # 変換自体は %TEMP%\MailExporter\{GUID}\ の短い一時フォルダ内だけで完結させる。
     $tempWorkDir = Join-Path ([System.IO.Path]::GetTempPath()) "MailExporter\$([System.Guid]::NewGuid().ToString('N'))"
     $doc = $null
 
     try {
         [System.IO.Directory]::CreateDirectory($tempWorkDir) | Out-Null
-
-        $tempHtmlPath = Join-Path $tempWorkDir "mail.html"
         $tempPdfPath = Join-Path $tempWorkDir "mail.pdf"
 
-        [System.IO.File]::WriteAllText($tempHtmlPath, $Html, [System.Text.Encoding]::UTF8)
+        Write-Log "    Word文書生成開始" -Level Info
+        $doc = New-MailWordDocument -WordApp $WordApp -Metadata $Metadata -BodyText $BodyText -AttachmentNames $AttachmentNames
+        Write-Log "    Word文書生成完了" -Level Info
 
-        # ConfirmConversions:$false でHTML読み込み時の変換確認ダイアログを抑止する
-        $doc = $WordApp.Documents.Open($tempHtmlPath, $false, $true, $false)
+        Write-Log "    PDF出力開始" -Level Info
         $doc.ExportAsFixedFormat($tempPdfPath, 17)
+        Write-Log "    PDF出力完了" -Level Info
 
-        # Wordの書き込み完了直後のファイルシステム反映待ちのため、ファイルができるまで一定回数だけ待つ
+        # 書き込み完了直後のファイルシステム反映待ちのため、ファイルができるまで一定回数だけ待つ
         $pdfSize = -1
         $pdfReady = $false
         for ($retryCount = 0; $retryCount -lt $CONFIG.PdfRetryCount; $retryCount++) {
@@ -728,11 +605,7 @@ function Process-SingleMail {
         $stage = "添付ファイル保存"
         $attachmentNames = Save-MailAttachments -mail $mail -outputDir $outputDir
 
-        # HTML生成
-        $stage = "HTML生成"
-        $finalHtml = New-MailHtml -mail $mail -metadata $metadata -attachmentNames $attachmentNames
-
-        # PDF変換（Wordとのやり取りは短い一時フォルダ内で完結させ、完成後に保存フォルダへ移動する）
+        # PDF変換（Word文書の作成〜変換は短い一時フォルダ内で完結させ、完成後に保存フォルダへ移動する）
         $stage = "PDF変換"
         $safeSender = Get-SafeFilename $metadata.SenderName -maxLength $CONFIG.MaxSenderLength
         $pdfName = "$($metadata.DateStr)_${safeSender}mail.pdf"
@@ -740,7 +613,8 @@ function Process-SingleMail {
 
         Write-Log "  PDF変換中..." -Level Info
 
-        $pdfResult = Convert-MailHtmlToPdf -Html $finalHtml -FinalPdfPath $finalPdfPath -WordApp $WordApp
+        $pdfResult = Convert-MailToPdf -Metadata $metadata -BodyText $mail.Body -AttachmentNames $attachmentNames `
+                                        -FinalPdfPath $finalPdfPath -WordApp $WordApp
 
         if ($pdfResult) {
             Write-Log "  PDF作成: $pdfName" -Level Success
@@ -817,8 +691,7 @@ try {
     }
     $word.Visible = $false
     $word.DisplayAlerts = 0
-    # マクロ実行等の確認ダイアログが表示される余地を無くすため、強制的に無効化する
-    # (メール本文のHTMLにマクロは含まれないが、念のための対策)
+    # マクロ実行等の確認ダイアログが表示される余地を無くすため、強制的に無効化する(念のための対策)
     try { $word.AutomationSecurity = 3 } catch {}
     Write-Log "Word起動: 成功" -Level Success
     Write-Log "--------------------------------------------" -Level Info
