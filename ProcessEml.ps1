@@ -5,23 +5,20 @@
 # --- 設定 ---
 $CONFIG = @{
     DesktopPath = [Environment]::GetFolderPath("Desktop")
-    EdgePaths = @(
-        "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
-    )
     MaxSubjectLength = 200
     MaxSenderLength = 50
     MaxPathLength = 240
-    PdfTimeout = 30
     OpenFolderAfterProcess = $true
     EnableLogging = $true
     # PDF生成設定
     PdfMinFileSize = 100
     PdfRetryCount = 10
     PdfRetryInterval = 500
-    # タイムアウトでEdgeをKillした後、StandardOutput/StandardErrorの取得を待つ上限(ミリ秒)。
-    # Process.Kill()はEdgeの子孫プロセスまで確実に終了させないため、無期限待機を避けるための上限。
-    PdfKillOutputWaitMs = 3000
+    # Word COMでのPDF変換(別プロセスのバックグラウンドジョブ内で実行)を待つ上限(秒)。
+    # ダイアログ表示等でWordが応答を返さなくなった場合に、mailexporter自体が無期限に
+    # 停止しないようにするための上限。超過時はジョブを停止し、このジョブが起動した
+    # WINWORD.EXEのみを終了させる(利用者が別途開いているWordには影響しない)。
+    WordExportTimeoutSec = 60
     # Outlook設定
     OutlookMailItemClass = 43
 }
@@ -271,13 +268,6 @@ function Release-Ref {
             # 既に解放済みの場合は無視
         }
     }
-}
-
-function Find-EdgePath {
-    foreach ($path in $CONFIG.EdgePaths) {
-        if (Test-Path $path) { return $path }
-    }
-    return $null
 }
 
 function Escape-HtmlText {
@@ -625,239 +615,172 @@ $footerHtml
     return "<html><head>$headInsert</head>" + $htmlBody + "</html>"
 }
 
-function Get-EdgeVersionString {
-    # PDF変換失敗時の切り分け用に、実際に使われているmsedge.exeのファイルバージョンを取得する。
-    # 取得に失敗してもメール処理自体は止めない。
-    param([string]$EdgePath)
+function Stop-TimedOutWordProcess {
+    # タイムアウト時のみ呼び出す。「変換開始前後のWINWORD.EXE差分」のような推測では
+    # 利用者が別途開いたWordまで誤って終了させかねないため使用しない。
+    # 代わりに、ジョブ側がWord COMインスタンス生成直後に自ら記録した確定PID(PidFilePath)
+    # だけを根拠にし、かつ実際にWINWORD.EXEであることを再確認できた場合のみ終了する。
+    # PIDを確実に特定できない場合は、誤って利用者のWordを終了するより、
+    # 残留の可能性をログへ記録するだけに留める。
+    param([string]$PidFilePath)
+
+    $procId = 0
     try {
-        return ([System.Diagnostics.FileVersionInfo]::GetVersionInfo($EdgePath)).FileVersion
-    } catch {
-        return $null
-    }
-}
-
-function Get-EdgePolicyDiagnostics {
-    # 組織ポリシー(HKLM/HKCU\SOFTWARE\Policies\Microsoft\Edge)のUserDataDir/PrintingEnabledを確認する。
-    # UserDataDirがポリシーで固定されていると、コマンドラインの--user-data-dir指定が無視され、
-    # 起動中の通常Edgeへコマンドラインが転送されて何もせずExitCode 0で終了することがあるため、
-    # PDF変換失敗時の切り分けに使う。レジストリ確認に失敗してもメール処理自体は止めない。
-    $hives = @(
-        @{ Name = "HKLM"; Path = "HKLM:\SOFTWARE\Policies\Microsoft\Edge" }
-        @{ Name = "HKCU"; Path = "HKCU:\SOFTWARE\Policies\Microsoft\Edge" }
-    )
-    $result = [ordered]@{}
-    foreach ($hive in $hives) {
-        try {
-            if (Test-Path -LiteralPath $hive.Path) {
-                $props = Get-ItemProperty -LiteralPath $hive.Path -ErrorAction Stop
-                $result["$($hive.Name)_UserDataDir"] = if ($null -ne $props.PSObject.Properties['UserDataDir']) { $props.UserDataDir } else { "(未設定)" }
-                $result["$($hive.Name)_PrintingEnabled"] = if ($null -ne $props.PSObject.Properties['PrintingEnabled']) { $props.PrintingEnabled } else { "(未設定)" }
-            } else {
-                $result["$($hive.Name)_UserDataDir"] = "(ポリシーキーなし)"
-                $result["$($hive.Name)_PrintingEnabled"] = "(ポリシーキーなし)"
-            }
-        } catch {
-            $result["$($hive.Name)_UserDataDir"] = "(確認失敗: $_)"
-            $result["$($hive.Name)_PrintingEnabled"] = "(確認失敗: $_)"
-        }
-    }
-    return $result
-}
-
-function Test-EdgeProfileCreated {
-    # 一時UserDataDir配下に実際にEdgeがプロファイルを作成した形跡(何らかのファイル/フォルダ)があるかを確認する。
-    # --user-data-dirを指定してもここが空のままなら、指定が無視された(=別プロセスへ転送された)疑いが強い。
-    param([string]$UserDataDir)
-    try {
-        if (-not (Test-Path -LiteralPath $UserDataDir)) { return $false }
-        $items = Get-ChildItem -LiteralPath $UserDataDir -ErrorAction SilentlyContinue
-        return ($null -ne $items -and @($items).Count -gt 0)
-    } catch {
-        return $false
-    }
-}
-
-function Write-EdgePdfFailureDiagnostics {
-    # PDF変換失敗時のみ呼び出す切り分け用ログ。成功時には出力しない。
-    param(
-        [string]$EdgePath,
-        [string[]]$ArgList,
-        [string]$UserDataDir,
-        [int]$ExistingEdgeProcessCountBefore
-    )
-
-    Write-Log "  Edge実行ファイル: $EdgePath" -Level Error
-
-    $version = Get-EdgeVersionString -EdgePath $EdgePath
-    Write-Log "  Edge Version: $(if ($version) { $version } else { '(取得失敗)' })" -Level Error
-
-    $policy = Get-EdgePolicyDiagnostics
-    Write-Log "  Edge Policy UserDataDir (HKLM): $($policy.HKLM_UserDataDir)" -Level Error
-    Write-Log "  Edge Policy UserDataDir (HKCU): $($policy.HKCU_UserDataDir)" -Level Error
-    Write-Log "  Edge Policy PrintingEnabled (HKLM): $($policy.HKLM_PrintingEnabled)" -Level Error
-    Write-Log "  Edge Policy PrintingEnabled (HKCU): $($policy.HKCU_PrintingEnabled)" -Level Error
-
-    Write-Log "  Edge起動引数: $($ArgList -join ' ')" -Level Error
-
-    try {
-        $afterCount = (Get-Process -Name "msedge" -ErrorAction SilentlyContinue | Measure-Object).Count
-    } catch {
-        $afterCount = -1
-    }
-    Write-Log "  既存msedgeプロセス数(起動前/終了後): $ExistingEdgeProcessCountBefore / $afterCount" -Level Error
-
-    $profileCreated = Test-EdgeProfileCreated -UserDataDir $UserDataDir
-    Write-Log "  一時UserDataDirへのプロファイル作成有無: $profileCreated ($UserDataDir)" -Level Error
-}
-
-function Get-ProcessOutputTaskTextOrTimeout {
-    # Process.Kill()はEdgeの子孫プロセス(GPU/レンダラー等)まで確実に終了させる保証がないため、
-    # 終了後もリダイレクトされたパイプの書き込み側ハンドルが残り、
-    # ReadToEndAsync().Resultが無期限にブロックする恐れがある。
-    # そのため有限時間だけ待ち、完了しなければ待たずに切り上げる。
-    param(
-        [System.Threading.Tasks.Task[string]]$Task,
-        [int]$TimeoutMilliseconds
-    )
-    if (-not $Task) { return "" }
-    try {
-        if ($Task.Wait($TimeoutMilliseconds)) {
-            return $Task.Result
+        if (Test-Path -LiteralPath $PidFilePath) {
+            $pidText = ([System.IO.File]::ReadAllText($PidFilePath)).Trim()
+            [void][int]::TryParse($pidText, [ref]$procId)
         }
     } catch {
-        return "(取得失敗: $_)"
+        $procId = 0
     }
-    return "(取得タイムアウト: $TimeoutMilliseconds ミリ秒以内に完了しませんでした)"
+
+    if ($procId -le 0) {
+        Write-Log "  タイムアウトしたWordプロセスを特定できなかったため終了しません。手動でのWord残留確認を推奨します。" -Level Warning
+        return
+    }
+
+    $proc = $null
+    try {
+        $proc = Get-Process -Id $procId -ErrorAction Stop
+    } catch {
+        Write-Log "  タイムアウトしたWordプロセス(PID:$procId)は既に終了していました" -Level Info
+        return
+    }
+
+    if ($proc.ProcessName -ne 'WINWORD') {
+        Write-Log "  記録されたPID($procId)がWINWORD.EXEではなかったため終了しません（現在: $($proc.ProcessName)）" -Level Warning
+        return
+    }
+
+    try {
+        Write-Log "  タイムアウトしたWord(PID:$procId)を終了します" -Level Warning
+        $proc.Kill()
+    } catch {
+        Write-Log "  タイムアウトしたWord(PID:$procId)の終了に失敗しました: $_" -Level Warning
+    }
 }
 
-function Invoke-EdgePrintToPdf {
+function Invoke-WordExportToPdf {
+    # Word.Application COMでHTMLをPDFへ変換する。
+    # 正常時・異常時とも、原則としてDocument.Close/Word.Application.Quit/
+    # Marshal.ReleaseComObject/GCによる通常のCOM解放だけで完結させる
+    # (WINWORD.EXEの存在有無を見て終了させる、といった間接的な判定は行わない)。
+    #
+    # ダイアログ表示等でWordが応答しなくなった場合にmailexporter自体が無期限に
+    # 停止しないよう、実際のCOM操作は別プロセス(バックグラウンドジョブ)内で行う。
+    # そのタイムアウト時に限り、ジョブ側がWord COMインスタンス生成直後に
+    # PidFilePathへ記録した確定PIDだけを対象に終了を試みる(Stop-TimedOutWordProcess)。
     param(
-        [string]$EdgePath,
-        [string]$HtmlUri,
+        [string]$HtmlPath,
         [string]$PdfPath,
-        [string]$UserDataDir
+        [string]$PidFilePath
     )
 
-    # StandardOutput/StandardError はパイプのバッファが詰まると子プロセスがブロックし
-    # デッドロックする恐れがあるため、WaitForExit を待つ前に非同期読み取りを開始する
-    # (Process.StandardOutput/Error.ReadToEndAsync は .NET Framework 4.5+ で利用可能)。
-    $process = $null
-    $stdOut = ""
-    $stdErr = ""
-    $exitCode = $null
+    $wordJobScript = {
+        param($HtmlPath, $PdfPath, $PidFilePath)
 
-    $argList = $null
-    $existingEdgeProcessCountBefore = -1
+        # ジョブは別プロセスで動くため、PID特定用のWin32 APIをこのプロセス内で定義する
+        try {
+            Add-Type -Namespace MailExporter -Name NativeMethods -MemberDefinition @"
+[DllImport("user32.dll")]
+public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+"@ -ErrorAction Stop
+        } catch {}
+
+        function Write-WordProcessIdIfPossible {
+            param($WordApp, [string]$PidFilePath)
+            try {
+                $hwnd = [IntPtr]$WordApp.Hwnd
+                if ($hwnd -eq [IntPtr]::Zero) { return }
+                $procId = [uint32]0
+                [void][MailExporter.NativeMethods]::GetWindowThreadProcessId($hwnd, [ref]$procId)
+                if ($procId -gt 0) {
+                    [System.IO.File]::WriteAllText($PidFilePath, $procId.ToString())
+                }
+            } catch {}
+        }
+
+        $word = $null
+        $doc = $null
+        try {
+            try {
+                $word = New-Object -ComObject Word.Application
+            } catch {
+                return @{ Success = $false; ErrorType = 'WordNotAvailable'; Message = $_.Exception.Message }
+            }
+
+            $word.Visible = $false
+            $word.DisplayAlerts = 0
+            # マクロ実行等の確認ダイアログが表示される余地を無くすため、強制的に無効化する
+            # (メール本文のHTMLにマクロは含まれないが、念のための対策)
+            try { $word.AutomationSecurity = 3 } catch {}
+
+            # タイムアウト発生時に「このジョブが起動したWord」だけを特定できるよう、
+            # できるだけ早い時点でPIDを記録しておく
+            Write-WordProcessIdIfPossible -WordApp $word -PidFilePath $PidFilePath
+
+            # ConfirmConversions:$false でHTML読み込み時の変換確認ダイアログを抑止する
+            $doc = $word.Documents.Open($HtmlPath, $false, $true, $false)
+
+            # Open前に取得できなかった場合の再試行(ウィンドウはOpen後には確実に存在する)
+            Write-WordProcessIdIfPossible -WordApp $word -PidFilePath $PidFilePath
+
+            $doc.ExportAsFixedFormat($PdfPath, 17)
+
+            return @{ Success = $true }
+        } catch {
+            return @{ Success = $false; ErrorType = 'ExportFailed'; Message = $_.Exception.Message }
+        } finally {
+            if ($doc) {
+                try { $doc.Close(0) } catch {}
+                try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($doc) | Out-Null } catch {}
+            }
+            if ($word) {
+                try { $word.Quit() } catch {}
+                try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null } catch {}
+            }
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+        }
+    }
+
+    $job = Start-Job -ScriptBlock $wordJobScript -ArgumentList $HtmlPath, $PdfPath, $PidFilePath
 
     try {
-        $argList = @(
-            "--headless"
-            "--disable-gpu"
-            "--disable-software-rasterizer"
-            "--disable-dev-shm-usage"
-            "--run-all-compositor-stages-before-draw"
-            # --disable-loggingと--log-level=3(FATALのみ)は失敗原因の切り分けを妨げるため外し、
-            # 代わりにstderrへログを出す。成功時はこの内容を参照しないため出力コストは無視できる。
-            "--enable-logging=stderr"
-            "--no-sandbox"
-            "--no-first-run"
-            "--no-default-browser-check"
-            # 職員が普段使いのEdgeを開いたままでもプロファイルが競合しないよう、
-            # 変換専用の一時プロファイルを使う
-            "--user-data-dir=`"$UserDataDir`""
-            "--print-to-pdf=`"$PdfPath`""
-            "`"$HtmlUri`""
-        )
+        $completed = Wait-Job -Job $job -Timeout $CONFIG.WordExportTimeoutSec
 
-        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $processInfo.FileName = $EdgePath
-        $processInfo.Arguments = $argList -join " "
-        $processInfo.UseShellExecute = $false
-        $processInfo.RedirectStandardOutput = $true
-        $processInfo.RedirectStandardError = $true
-        $processInfo.CreateNoWindow = $true
+        if (-not $completed) {
+            Write-Log "  Word変換がタイムアウトしました（$($CONFIG.WordExportTimeoutSec)秒）" -Level Error
+            try { Stop-Job -Job $job -ErrorAction SilentlyContinue } catch {}
+            Stop-TimedOutWordProcess -PidFilePath $PidFilePath
+            return @{ Success = $false; ErrorType = 'Timeout'; Message = "Word変換がタイムアウトしました" }
+        }
 
-        # 失敗時に「起動前から既にEdgeが動いていたか」を判定するための基準値
-        # (UserDataDirポリシーで--user-data-dirが無視され、既存Edgeへコマンドラインが
-        # 転送されて何もせずExitCode 0で終わるケースを切り分けるため)
+        $result = $null
         try {
-            $existingEdgeProcessCountBefore = (Get-Process -Name "msedge" -ErrorAction SilentlyContinue | Measure-Object).Count
+            $result = Receive-Job -Job $job -ErrorAction Stop
         } catch {
-            $existingEdgeProcessCountBefore = -1
+            $result = @{ Success = $false; ErrorType = 'Unknown'; Message = $_.Exception.Message }
+        }
+        if (-not $result) {
+            $result = @{ Success = $false; ErrorType = 'Unknown'; Message = "Word変換ジョブから結果を取得できませんでした" }
         }
 
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo = $processInfo
-        $process.Start() | Out-Null
-
-        $stdOutTask = $process.StandardOutput.ReadToEndAsync()
-        $stdErrTask = $process.StandardError.ReadToEndAsync()
-
-        $exited = $process.WaitForExit($CONFIG.PdfTimeout * 1000)
-
-        if (-not $exited) {
-            try { $process.Kill() } catch {}
-            # Kill()後もEdgeの子孫プロセスがパイプを保持している可能性があるため、
-            # ここで無期限に待たず、有限時間で取得を打ち切る
-            $stdOut = Get-ProcessOutputTaskTextOrTimeout -Task $stdOutTask -TimeoutMilliseconds $CONFIG.PdfKillOutputWaitMs
-            $stdErr = Get-ProcessOutputTaskTextOrTimeout -Task $stdErrTask -TimeoutMilliseconds $CONFIG.PdfKillOutputWaitMs
-            Write-Log "  PDF変換タイムアウト（$($CONFIG.PdfTimeout)秒）" -Level Error
-            Write-EdgePdfFailureDiagnostics -EdgePath $EdgePath -ArgList $argList -UserDataDir $UserDataDir `
-                                            -ExistingEdgeProcessCountBefore $existingEdgeProcessCountBefore
-            if ($stdErr) { Write-Log "  StandardError: $stdErr" -Level Error }
-            if ($stdOut) { Write-Log "  StandardOutput: $stdOut" -Level Error }
-            return $false
-        }
-
-        $exitCode = $process.ExitCode
-        try { $stdOut = $stdOutTask.Result } catch {}
-        try { $stdErr = $stdErrTask.Result } catch {}
-
-        # Edgeの終了直後はPDFの書き込みが終わっていないことがあるため、
-        # ファイルができるまで一定回数だけ待つ
-        $pdfSize = -1
-        for ($retryCount = 0; $retryCount -lt $CONFIG.PdfRetryCount; $retryCount++) {
-            $pdfFile = Get-Item -LiteralPath $PdfPath -ErrorAction SilentlyContinue
-            if ($pdfFile) {
-                $pdfSize = $pdfFile.Length
-                if ($pdfSize -gt $CONFIG.PdfMinFileSize) { return $true }
-            }
-            Start-Sleep -Milliseconds $CONFIG.PdfRetryInterval
-        }
-
-        # 失敗時のみ、原因追跡に必要な情報を記録する（成功時は残さない）
-        Write-Log "  Edge ExitCode: $exitCode" -Level Error
-        Write-Log "  PDF出力ファイルの存在: $([System.IO.File]::Exists($PdfPath))" -Level Error
-        Write-Log "  PDF出力ファイルサイズ: $pdfSize" -Level Error
-        Write-EdgePdfFailureDiagnostics -EdgePath $EdgePath -ArgList $argList -UserDataDir $UserDataDir `
-                                        -ExistingEdgeProcessCountBefore $existingEdgeProcessCountBefore
-        if ($stdErr) { Write-Log "  StandardError: $stdErr" -Level Error }
-        if ($stdOut) { Write-Log "  StandardOutput: $stdOut" -Level Error }
-        return $false
-
-    } catch {
-        Write-Log "  PDF変換処理でエラー: $_" -Level Error
-        Write-EdgePdfFailureDiagnostics -EdgePath $EdgePath -ArgList $argList -UserDataDir $UserDataDir `
-                                        -ExistingEdgeProcessCountBefore $existingEdgeProcessCountBefore
-        return $false
+        # 正常にジョブが完了した場合、Word側は既に自身のfinally内でClose/Quit/COM解放を
+        # 完了しているはずであり、ここでの追加のプロセス終了処理は行わない。
+        return $result
     } finally {
-        if ($process) {
-            try {
-                if (-not $process.HasExited) { $process.Kill() }
-            } catch {}
-            $process.Dispose()
-        }
+        try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch {}
     }
 }
 
 function Convert-MailHtmlToPdf {
     param(
         [string]$Html,
-        [string]$EdgePath,
         [string]$FinalPdfPath
     )
 
-    # 件名等の利用者由来の長い/特殊文字を含むパスをEdgeへ直接渡さないよう、
+    # 件名等の利用者由来の長い/特殊文字を含むパスをWordへ直接渡さないよう、
     # %TEMP%\MailExporter\{GUID}\ の短い一時フォルダ内だけで変換を完結させる。
     $tempWorkDir = Join-Path ([System.IO.Path]::GetTempPath()) "MailExporter\$([System.Guid]::NewGuid().ToString('N'))"
 
@@ -866,16 +789,41 @@ function Convert-MailHtmlToPdf {
 
         $tempHtmlPath = Join-Path $tempWorkDir "mail.html"
         $tempPdfPath = Join-Path $tempWorkDir "mail.pdf"
-        $tempProfileDir = Join-Path $tempWorkDir "profile"
+        $tempPidPath = Join-Path $tempWorkDir "word.pid"
 
         [System.IO.File]::WriteAllText($tempHtmlPath, $Html, [System.Text.Encoding]::UTF8)
 
-        # 空白等を含む一時パスでもコマンドライン上で問題にならないよう file:// URI化する
-        $htmlUri = ([System.Uri]$tempHtmlPath).AbsoluteUri
+        $result = Invoke-WordExportToPdf -HtmlPath $tempHtmlPath -PdfPath $tempPdfPath -PidFilePath $tempPidPath
 
-        $pdfOk = Invoke-EdgePrintToPdf -EdgePath $EdgePath -HtmlUri $htmlUri -PdfPath $tempPdfPath `
-                                       -UserDataDir $tempProfileDir
-        if (-not $pdfOk) {
+        if (-not $result.Success) {
+            if ($result.ErrorType -eq 'WordNotAvailable') {
+                Write-Log "  Microsoft Wordを起動できませんでした。" -Level Error
+                Write-Log "  Microsoft Wordがインストールされていることを確認してください。" -Level Error
+            } else {
+                Write-Log "  PDF生成に失敗しました: $($result.Message)" -Level Error
+            }
+            return $false
+        }
+
+        # Wordの書き込み完了直後のファイルシステム反映待ちのため、ファイルができるまで一定回数だけ待つ
+        $pdfSize = -1
+        $pdfReady = $false
+        for ($retryCount = 0; $retryCount -lt $CONFIG.PdfRetryCount; $retryCount++) {
+            $pdfFile = Get-Item -LiteralPath $tempPdfPath -ErrorAction SilentlyContinue
+            if ($pdfFile) {
+                $pdfSize = $pdfFile.Length
+                if ($pdfSize -gt $CONFIG.PdfMinFileSize) {
+                    $pdfReady = $true
+                    break
+                }
+            }
+            Start-Sleep -Milliseconds $CONFIG.PdfRetryInterval
+        }
+
+        if (-not $pdfReady) {
+            Write-Log "  PDF生成に失敗しました（出力ファイルが確認できません）" -Level Error
+            Write-Log "  PDF出力ファイルの存在: $([System.IO.File]::Exists($tempPdfPath))" -Level Error
+            Write-Log "  PDF出力ファイルサイズ: $pdfSize" -Level Error
             return $false
         }
 
@@ -904,8 +852,7 @@ function Process-SingleMail {
     param(
         $mail,
         [int]$index,
-        [int]$total,
-        [string]$edgePath
+        [int]$total
     )
 
     # 前のメールのログ状態(バッファ/ログファイル)を引き継がない
@@ -935,7 +882,7 @@ function Process-SingleMail {
         $stage = "HTML生成"
         $finalHtml = New-MailHtml -mail $mail -metadata $metadata -attachmentNames $attachmentNames
 
-        # PDF変換（Edgeとのやり取りは短い一時フォルダ内で完結させ、完成後に保存フォルダへ移動する）
+        # PDF変換（Wordとのやり取りは短い一時フォルダ内で完結させ、完成後に保存フォルダへ移動する）
         $stage = "PDF変換"
         $safeSender = Get-SafeFilename $metadata.SenderName -maxLength $CONFIG.MaxSenderLength
         $pdfName = "$($metadata.DateStr)_${safeSender}mail.pdf"
@@ -943,7 +890,7 @@ function Process-SingleMail {
 
         Write-Log "  PDF変換中..." -Level Info
 
-        $pdfResult = Convert-MailHtmlToPdf -Html $finalHtml -EdgePath $edgePath -FinalPdfPath $finalPdfPath
+        $pdfResult = Convert-MailHtmlToPdf -Html $finalHtml -FinalPdfPath $finalPdfPath
 
         if ($pdfResult) {
             Write-Log "  PDF作成: $pdfName" -Level Success
@@ -985,15 +932,30 @@ try {
     Write-Log "Outlookメール保存ツール 開始" -Level Info
     Write-Log "============================================" -Level Info
 
-    # Edge確認
-    $edgePath = Find-EdgePath
-    if (-not $edgePath) {
-        Write-Log "Microsoft Edgeが見つかりません。" -Level Error
-        Write-Log "Edgeをインストールするか、パスを確認してください。" -Level Error
-        Save-PendingLogToDesktop -Reason "起動時エラー: Edgeが見つからない"
-        exit 1
+    # Word確認（実際にCOMインスタンスを生成できるかを確認し、確認用インスタンスは即座に終了する）
+    # 生成後に例外が発生してもWordが残らないよう、Quit/COM解放はtry/finallyで確実に行う
+    $wordProbe = $null
+    try {
+        try {
+            $wordProbe = New-Object -ComObject Word.Application
+        } catch {
+            Write-Log "Microsoft Wordを起動できませんでした。" -Level Error
+            Write-Log "Microsoft Wordがインストールされていることを確認してください。" -Level Error
+            Save-PendingLogToDesktop -Reason "起動時エラー: Wordを起動できない"
+            exit 1
+        }
+
+        $wordProbe.Visible = $false
+        $wordProbe.DisplayAlerts = 0
+        Write-Log "Word接続確認: 成功" -Level Success
+    } finally {
+        if ($wordProbe) {
+            try { $wordProbe.Quit() } catch {}
+            Release-Ref $wordProbe
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+        }
     }
-    Write-Log "Edge: $edgePath" -Level Info
 
     # Outlook接続
     try {
@@ -1033,7 +995,7 @@ try {
                 continue
             }
 
-            $outputDir = Process-SingleMail -mail $mail -index $mailIndex -total $selection.Count -edgePath $edgePath
+            $outputDir = Process-SingleMail -mail $mail -index $mailIndex -total $selection.Count
 
             if ($outputDir) {
                 $processedFolders += $outputDir
